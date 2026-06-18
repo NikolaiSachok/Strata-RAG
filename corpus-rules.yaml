@@ -1,0 +1,155 @@
+# corpus-rules.yaml — the TRUSTED, deterministic relevance ruleset (Tier 1).
+#
+# "Noise vs signal" only means something relative to a stated PURPOSE. That purpose is
+# `corpus_intent` (config.py / RAGEVAL_CORPUS_INTENT). These rules encode that intent as
+# fast, auditable, human-editable patterns. They are the artifact that ACTUALLY RUNS.
+#
+# The Tier-2 LLM advisor (classify.py --advise) may PROPOSE changes to this file, but it
+# never edits it silently: a human reviews the diff and commits. Untrusted model
+# proposes; this committed ruleset enforces. (Same trust boundary as the rest of the
+# engine.)
+#
+# Evaluation order for each discovered SourceDoc:
+#   0. keep_doc_types         — synthetic doc_type on the keep-list → INCLUDE (wins first)
+#   1. exclude_dirs           — any path part matches → EXCLUDE (reason: noise dir)
+#   2. exclude_filenames      — exact filename match → EXCLUDE (reason: known noise file)
+#   3. exclude_filename_globs — glob match (e.g. prd_*.md) → EXCLUDE
+#   4. exclude_doc_types      — the adapter's coarse doc_type is in the noise list → EXCLUDE
+#   5. exclude_ext            — extension not in the allow list → EXCLUDE
+#   6. min_chars              — extracted text shorter than this → EXCLUDE (near-empty)
+#   7. otherwise              — INCLUDE
+# The FIRST matching rule wins and is recorded as the reason in the dry-run manifest.
+
+# Human-readable note on what this ruleset is tuned for (keep in sync with corpus_intent).
+intent_note: >
+  Keep user-facing product/theme content (descriptions, overviews, promo copy, specs
+  that describe the product). Drop template changelogs, agent-authored planning/build
+  files, and engineering READMEs.
+
+# Allowed content extensions. Anything else a discovery adapter yields is excluded.
+# php/html/htm are allowed ONLY because the adapters' index.php/html PROMO FALLBACK yields
+# stripped, visible landing-page copy as a last-resort product source. Adapters never yield
+# arbitrary .php/.html files — only a project's index.* when it has no description doc.
+allow_ext:
+  - md
+  - txt
+  - docx
+  - php
+  - html
+  - htm
+
+# Synthetic doc_types that are ALWAYS kept, regardless of extension / length / file rules.
+# These are adapter-emitted PROVENANCE records, not files on disk — e.g. a 'marker' doc for a
+# non-conforming project (Vega/) that has only binaries and no description. Keeping them makes
+# "which projects are non-conforming / banned?" answerable from the index/sidecar.
+keep_doc_types:
+  - marker
+
+# doc_types that are INCLUDED but METADATA-ONLY: kept in the pipeline (consumed by the enrich
+# step, never a blind spot) but NOT embedded as retrieval chunks. settings.md is tagged
+# 'metadata' by the adapters: it's structured per-project metadata (Brand/Theme/Mascot/Category),
+# not narrative — embedding many such docs dilutes top-k, so the indexer SKIPS it while enrich
+# PREFERS its structured fields. (See classify.Decision.metadata_only + enrich.py.)
+metadata_only_doc_types:
+  - metadata
+
+# Directory names that mark NOISE. If any part of a doc's path matches, it's excluded.
+# (Matched case-insensitively against each path component.)
+exclude_dirs:
+  - build
+  - .dart_tool
+  - node_modules
+  - test
+  - screenshots
+  # NOTE: 'back' is NOT excluded — in some corpus layouts the product description/PRD lives
+  # under back/ (back/description.md). The filename/doc_type rules below still drop the genuine
+  # back/ noise (README, task, CLAUDE, CHANGELOG, implementation_plan, prd).
+
+# Exact filenames that are always noise for this intent (matched case-insensitively).
+exclude_filenames:
+  - changelog.md
+  - changelog.txt
+  - claude.md
+  - task.md
+  - implementation_plan.md
+  - readme.md          # engineering READMEs in this corpus are build instructions, not product content
+  # --- layout-audit additions (agent-authored WEBSITE-BUILD specs + build/legal/asset docs) ---
+  - prd.md                   # product-requirements docs: agent-authored build specs, not product content
+  - prd_match3_game.md       # specific PRD variant seen in the audit
+  - match3_game_spec.md      # game build spec, not user-facing content
+  - technical_guide.md       # build/setup guide
+  - assets_list.md           # asset manifest
+  - setup.md                 # setup instructions
+  - attributions.md          # legal/asset attributions
+  - guidelines.md            # build guidelines
+  # --- Tier-2 advisor proposals, human-approved (technical/build docs mislabeled 'spec') ---
+  - api_guide.md             # API integration strategy (e.g. TheSportsDB/Statpal) — implementation doc
+  - conversion_plan.md       # "iOS→Flutter conversion plan" — a build plan
+  - webview-back-button-issue.md  # engineering bug write-up
+  - analytics_attribution.md # analytics/attribution post-mortem — marketing-ops/technical, not app content
+  # --- coding-agent BUILD INSTRUCTIONS (raw, exclude from embedding) -------------------------
+  # design_system.md (~40-82 chunks each) is a coding-agent build spec, not product narrative;
+  # embedding the RAW doc floods top-k with implementation noise. The app's actual LOOK is better
+  # answered by the Phase 1.5 promo screenshots (rendered_actual). A future "distillation track"
+  # (see DECISIONS.md) will embed a COMPACT design_intent summary instead — the raw doc is
+  # excluded here; the distillation is ⏳ planned, NOT built.
+  - design_system.md         # coding-agent design-system build instructions (raw) — distill, don't embed raw
+
+# Glob-style filename patterns (case-insensitive). Cover families like prd_*.md (prd_v2.md,
+# prd_app.md) that a fixed list can't enumerate. fnmatch semantics.
+exclude_filename_globs:
+  - prd_*.md
+  # Interactive-mockup requirements (e.g. "<app>_interactive_mockup_requirements.md") are
+  # coding-agent build instructions for generating a React mockup — ~40-82 chunks of build noise,
+  # not product narrative. Exclude the RAW doc from embedding (the distillation track, ⏳ planned,
+  # will embed a compact design_intent summary instead).
+  - "*_interactive_mockup_requirements.md"
+
+# Coarse doc_types (assigned by the adapters) that are noise for this intent.
+# NOTE: 'config' is the key audit finding — docs/*.txt are config/credential/Figma-link dumps
+# (NOT product), so the adapters tag .txt directly under a docs/ dir as doc_type 'config' and
+# we drop it here. promo/*.txt is tagged 'promo' instead and is KEPT (real store copy).
+exclude_doc_types:
+  - changelog
+  - plan
+  - agent_doc
+  - readme
+  - config
+
+# Minimum extracted character count. Shorter = near-empty boilerplate → excluded.
+min_chars: 40
+
+# PII redaction policy (POLICY-AWARE, not blanket). Secret redaction (credentials) is separate
+# and always on; THIS governs the complementary PERSONAL-PII pass. Data-classification practice:
+# redact PERSONAL emails, but PRESERVE PUBLISHED business contacts (a `support@` in a store
+# description is a legitimate, queryable contact). The HUMAN sets policy here; the engine
+# enforces it (same trust boundary as corpus_intent).
+#   - An email is KEPT if EITHER it lives in a public_doc_type OR its local-part is role-based.
+#   - Otherwise (a personal-looking address in an internal doc) it → [REDACTED_EMAIL].
+# (Phone-number redaction is a documented future extension; not enabled.)
+pii_policy:
+  redact_personal_emails: true
+  preserve_published_contacts: true
+  # Functional/role local-parts = business addresses, kept even in internal docs.
+  role_local_parts:
+    - support
+    - info
+    - contact
+    - help
+    - hello
+    - sales
+    - privacy
+    - legal
+    - admin
+    - team
+    - press
+    - partnerships
+    - no-reply
+    - noreply
+    - feedback
+  # Public-facing doc_types whose contacts are deliberately published → emails kept.
+  public_doc_types:
+    - promo
+    - description
+    - store_listing
+    - landing

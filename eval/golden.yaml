@@ -1,0 +1,51 @@
+# Golden set — hand-labelled eval questions over the SAMPLE corpus (data/sample/).
+#
+# Each item is: a natural-language question + the set of project ids that a human judges
+# RELEVANT. Project ids are "source_set/project_id" (e.g. "northwind/0001"), matching the
+# identity chunks carry. The eval harness retrieves for each question, maps the retrieved
+# chunks to their project ids, and scores the ranking against `relevant` with Recall@K,
+# Precision@K, MRR, and nDCG.
+#
+# Keep these honest: label what you actually believe is relevant from the corpus content,
+# not what you hope the retriever returns. A few have one relevant project; the
+# set-style questions ("fruit theme", "has humor") have several — those exercise recall.
+#
+# Corpus cheat-sheet (for the labeller):
+#   northwind/0001  Citrus Garden   — to-do, CITRUS/fruit theme, HUMOR (lemon mascot)
+#   northwind/0002  Orbit Focus     — focus timer, SPACE theme, no humor
+#   northwind/0003  Tide Tracker    — habit tracker, OCEAN theme, HUMOR (turtle)
+#   atlas/atlas-ledger  Lemon Ledger  — budgeting, CITRUS/lemon theme, no humor
+#   atlas/atlas-orchard Orchard Recipes — recipes, ORCHARD/garden/fruit theme, HUMOR (apple)
+
+questions:
+  - id: q_citrus
+    question: "Which projects use a citrus or fruit-themed design?"
+    relevant: ["northwind/0001", "atlas/atlas-ledger", "atlas/atlas-orchard"]
+
+  - id: q_space
+    question: "Is there an app with a space or astronomy theme?"
+    relevant: ["northwind/0002"]
+
+  - id: q_ocean
+    question: "Find the habit tracker themed around the ocean and tides."
+    relevant: ["northwind/0003"]
+
+  - id: q_humor
+    question: "Which apps use jokes, puns, or a comedic mascot?"
+    relevant: ["northwind/0001", "northwind/0003", "atlas/atlas-orchard"]
+
+  - id: q_budget
+    question: "Is there a budgeting or personal-finance app?"
+    relevant: ["atlas/atlas-ledger"]
+
+  - id: q_recipe
+    question: "Which project helps you organise recipes?"
+    relevant: ["atlas/atlas-orchard"]
+
+  - id: q_focus_timer
+    question: "Find a Pomodoro-style focus timer."
+    relevant: ["northwind/0002"]
+
+  - id: q_todo
+    question: "Which app is a to-do list where finishing tasks grows a plant?"
+    relevant: ["northwind/0001"]

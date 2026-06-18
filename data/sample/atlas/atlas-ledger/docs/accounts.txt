@@ -1,0 +1,11 @@
+Build accounts and credentials dump (NOISE — docs/*.txt is config/credential, not product).
+
+This file exists to exercise: (a) docs/*.txt → doc_type 'config' → EXCLUDED, and
+(b) defense-in-depth redaction if it ever WERE included.
+
+sportsdata.io login: data-bot@example.com:Sup3rSecretPass!
+api_key = 7e3a9c1b5d2f48069a8b7c6d5e4f3a2b1c0d9e8f
+password: hunter2hunter2hunter2
+keystore: release.jks
+keystore_password: kSpassWORD123456
+figma: https://figma.com/proto/ZyXwVu987/Onboarding

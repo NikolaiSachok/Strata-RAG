@@ -1,0 +1,10 @@
+# Northwind project 0004 — "Pebble Notes" (a sticky-notes app).
+#
+# This project ships ONLY a pubspec.yaml: it has NO description, overview, or promo
+# content doc. It exists so the coverage report can flag it as a BLIND SPOT (a project
+# with zero content docs) — the kind of gap the manifest is meant to surface.
+name: pebble_notes
+description: A minimalist sticky-notes app.
+version: 1.0.0
+environment:
+  sdk: ">=3.4.0 <4.0.0"

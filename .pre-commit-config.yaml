@@ -1,0 +1,29 @@
+# Local commit-time gates. Install once:
+#   pip install pre-commit && pre-commit install
+# Run on demand over everything:
+#   pre-commit run --all-files
+#
+# The semantic LLM gate (scripts/semantic-audit.py) is NOT wired here — it needs an API key
+# and runs in CI. This file is the cheap, offline, deterministic layer.
+
+repos:
+  # --- stock hygiene hooks -------------------------------------------------
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-merge-conflict
+      - id: detect-private-key
+
+  # --- the deterministic leak hard-gate (this repo) ------------------------
+  - repo: local
+    hooks:
+      - id: leak-check
+        name: leak-check (deterministic generic leak guard)
+        entry: scripts/leak-check.sh
+        language: script
+        # No `files:` filter — the script reads the staged diff itself and applies
+        # its own exclusions (its own file, .venv, data/sample, tests, ...).
+        pass_filenames: false
+        always_run: true

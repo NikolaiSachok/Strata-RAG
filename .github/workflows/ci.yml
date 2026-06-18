@@ -1,0 +1,78 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # A) tests
+  # ---------------------------------------------------------------------------
+  test:
+    name: tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install (editable + dev extras)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+      - name: Run tests
+        run: python -m pytest -q
+
+  # ---------------------------------------------------------------------------
+  # B) deterministic leak gate (hard gate — no key needed)
+  # ---------------------------------------------------------------------------
+  leak-check:
+    name: leak-check (deterministic)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Scan the repo for generic leak patterns
+        run: bash scripts/leak-check.sh .
+
+  # ---------------------------------------------------------------------------
+  # C) semantic leak gate (LLM hostile reviewer) — OPTIONAL/demo gate.
+  #    CI has no local `claude` CLI, so the script uses ANTHROPIC_API_KEY (API
+  #    backend) when the secret is set, and SKIPS GRACEFULLY when it is absent
+  #    (so the repo's CI is green before the key is configured). Locally the
+  #    maintainer runs the same script for FREE on their Claude subscription
+  #    (the script auto-selects the `claude` CLI backend).
+  # ---------------------------------------------------------------------------
+  semantic-audit:
+    name: semantic-audit (LLM, optional)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0          # need history to diff against the base ref
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install audit deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install anthropic PyYAML
+      - name: Semantic audit of the diff
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          if [ -z "${ANTHROPIC_API_KEY}" ]; then
+            echo "ANTHROPIC_API_KEY secret is not set — skipping the semantic gate."
+            echo "Set it in repo Settings → Secrets and variables → Actions to enable it."
+            exit 0
+          fi
+          # Diff against the PR base (or the previous push), falling back to HEAD~1.
+          BASE="${{ github.event.pull_request.base.sha }}"
+          if [ -z "${BASE}" ]; then BASE="${{ github.event.before }}"; fi
+          if [ -z "${BASE}" ] || ! git cat-file -e "${BASE}^{commit}" 2>/dev/null; then
+            BASE="$(git rev-parse HEAD~1 2>/dev/null || echo HEAD)"
+          fi
+          echo "Auditing files changed since ${BASE}"
+          python scripts/semantic-audit.py --base "${BASE}"

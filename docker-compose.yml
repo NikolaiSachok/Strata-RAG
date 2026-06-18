@@ -1,0 +1,35 @@
+# Qdrant — the vector database this engine indexes into.
+#
+# WHY a server (vs. the embedded Chroma the original demo used): an enterprise RAG
+# engine indexing hundreds of projects wants a real ANN index server you can point
+# multiple processes at, inspect over HTTP, and tune (HNSW params, payload indexes).
+# Qdrant runs as one container; nothing about the engine assumes it's local except
+# the URL, so the same code talks to a managed Qdrant in production.
+#
+#   docker compose up -d qdrant      # start it
+#   docker compose down              # stop it (the named volume keeps the index)
+#
+# Ports:
+#   6333 — REST + the web dashboard (open http://localhost:6333/dashboard)
+#   6334 — gRPC (faster; qdrant-client can use it, we default to REST for clarity)
+services:
+  qdrant:
+    image: qdrant/qdrant:v1.18.2
+    container_name: rageval-qdrant
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      # The index lives in a Docker-managed volume, NOT in the repo, so we never
+      # accidentally commit vectors built from a real corpus. `docker compose down -v`
+      # wipes it.
+      - rageval_qdrant_storage:/qdrant/storage
+    # A healthcheck so `docker compose up --wait` blocks until Qdrant is actually ready.
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c ':> /dev/tcp/127.0.0.1/6333' || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  rageval_qdrant_storage:

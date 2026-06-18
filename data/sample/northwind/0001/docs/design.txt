@@ -1,0 +1,8 @@
+Visual / theme design requirements for Citrus Garden
+
+Palette: warm lemon yellow, lime green, soft cream background. Rounded, friendly shapes.
+Mascot: Zest, a cartoon lemon with expressive eyes; appears on empty states and on the
+harvest screen. Typography should feel hand-drawn but legible at small sizes.
+
+Mood: cheerful, low-pressure, garden-cozy. Animations are gentle (fruit gently bobbing,
+vines growing in). Avoid harsh reds for overdue items — use a wilting muted green instead.

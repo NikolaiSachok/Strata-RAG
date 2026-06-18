@@ -1,0 +1,9 @@
+Backend scratch notes for atlas-ledger.
+
+API endpoints (planned):
+  GET  /budget
+  POST /transaction
+
+This is a back/ engineering note, not product content. Whether it counts as signal
+depends on the corpus_intent — for a content corpus it's borderline; the classifier
+treats files under back/ as low-priority and the dry-run manifest surfaces them.

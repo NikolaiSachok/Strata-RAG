@@ -1,0 +1,17 @@
+# FICTIONAL sample config.yaml — mirrors the real corpus shape so the deterministic harvest
+# (harvest.py) can be tested. The `app:` block holds CLEAN, non-secret metadata that IS
+# harvested (whitelist). The blocks BELOW it are fake SECRETS that must NEVER be harvested or
+# stored — they prove the whitelist excludes them. All values here are invented.
+app:
+  name: 'Vista Weather'
+  number: '7011'
+  domain: 'vista-weather-7011.test'
+  bundle_id: test.example.vista
+  localization: EN
+
+# --- everything below is SECRET and MUST be excluded by the field whitelist ---
+analytics:
+  api_key: fake_value_never_harvested
+integration:
+  token: fake_value_never_harvested
+  session_id: fake_value_never_harvested

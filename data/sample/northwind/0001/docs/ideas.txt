@@ -1,0 +1,10 @@
+Gameplay / concept ideas for Citrus Garden
+
+The core loop: each completed task waters the citrus tree and grows one piece of fruit.
+A full tree ends the day with a "harvest" celebration. Streaks are modeled as healthy
+vines; missed days cause a vine to wilt until the next completed task revives it.
+
+Stretch ideas:
+- Seasonal themes (a winter citrus grove with frost effects).
+- A weekly "basket" you can share as an image.
+- Zest the lemon mascot reacts with puns when you finish a hard task.

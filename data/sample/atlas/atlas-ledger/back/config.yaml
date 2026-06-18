@@ -1,0 +1,15 @@
+# FICTIONAL sample config.yaml for a project that ALSO has a settings.md brand. Tests that the
+# settings.md brand ("Lemon Ledger") is NOT clobbered while the harvest still supplies the
+# authoritative domain/landing_url/app_number/etc. Fake secret blocks prove the whitelist holds.
+app:
+  name: 'Lemon Ledger'
+  number: '7022'
+  domain: 'lemon-ledger-7022.test'
+  bundle_id: test.example.lemonledger
+  localization: EN
+
+analytics:
+  api_key: fake_value_never_harvested
+integration:
+  token: fake_value_never_harvested
+  session_id: fake_value_never_harvested

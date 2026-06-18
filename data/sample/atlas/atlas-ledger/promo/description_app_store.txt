@@ -1,0 +1,10 @@
+Lemon Ledger — squeeze more out of your budget.
+
+Lemon Ledger turns budgeting into something bright and refreshing. Watch your savings goal
+fill a lemon with juice as you put money aside, sort spending into zesty citrus categories,
+and get a cheerful monthly "squeeze" report. Clean, simple, and a little bit sunny.
+
+DERIVED store listing: this is the App Store reformatting of the canonical description.docx
+(trimmed to the App Store length limit). It is a near-duplicate, so when description.docx
+exists this file is SUPPRESSED by the adapter — it never reaches retrieval and never
+triplicates atlas-ledger in top-k results.

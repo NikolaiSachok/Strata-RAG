@@ -1,0 +1,10 @@
+Summit Stepper — climb a mountain, one habit at a time.
+
+Summit Stepper turns daily habits into an alpine ascent: every streak you keep moves your
+climber higher up a hand-drawn peak, with base-camp checkpoints, weather that reacts to your
+consistency, and a summit celebration when you reach a 30-day goal.
+
+STORE-ONLY project: atlas-summit has NO canonical description.md / description.docx — this
+app-store listing is the SOLE product copy. The adapter's store-listing fallback therefore
+YIELDS this file (zero blind spot), exactly like the index.* landing-page fallback would for
+a project whose only product source is its landing page.

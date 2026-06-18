@@ -1,0 +1,6 @@
+Build / account setup notes (NOT product content — config/credential dump)
+
+store_account: dev@example.com
+api_key: 11aa22bb33cc44dd55ee66ff77001122
+keystore_password: ChangeMe123456
+figma: https://www.figma.com/file/QwErTy999/Citrus-Garden-Design

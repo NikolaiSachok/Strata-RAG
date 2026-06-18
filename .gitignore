@@ -1,0 +1,58 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+
+# Local secrets & state
+.env
+
+# --- DATA SEPARATION (mandatory) --------------------------------------------
+# The vector index, the metadata sidecar, and any extracted-metadata dumps are DERIVED
+# from whatever corpus you point the engine at. When that corpus is the real (private)
+# one, these artifacts contain its brand/theme content. NEVER commit them. The synthetic
+# data/sample/ corpus is the only corpus that ships.
+# NOTE: gitignore does NOT support inline (same-line) comments — keep patterns bare.
+
+# vector index, if Qdrant is ever run in single-file/local mode in this folder
+.qdrant/
+# the SQLite metadata sidecar (rageval.sqlite) and any other sqlite files
+*.sqlite
+*.sqlite3
+# never copy the real corpus into the repo
+data/real/
+# dry-run manifests / coverage reports (may name real projects)
+manifests/
+*.manifest.json
+*.manifest.md
+# extracted-metadata dumps
+extracted-metadata*.json
+# NOTE: data/*.tsv (brand maps) and eval/golden.real*.yaml (real labels) are HAND-CREATED and are
+# intentionally TRACKED in this PRIVATE repo — gitignore excludes only DERIVED/large artifacts
+# (index, sidecar, real-corpus copy), not effort we want versioned. The public/private boundary is
+# the clean-room strip-list in CLAUDE.md "Public release manifest", NOT this file.
+
+# binary / build placeholders in the SYNTHETIC sample corpus. The adapters read these by
+# FILENAME only (Vega markers) or skip them (Kotlin source), never the bytes — so there's no
+# reason to commit binaries. A conftest fixture recreates them so a fresh clone still works.
+# (Text content fixtures .md/.docx/.txt stay committed — the pipeline actually parses them.)
+data/sample/**/*.rar
+data/sample/**/*.zip
+data/sample/**/*.aab
+data/sample/**/*.apk
+data/sample/**/*.jks
+data/sample/**/*.kt
+data/sample/**/*.kts
+data/sample/**/*.gradle
+data/sample/**/*.properties
+
+# legacy embedded store from the original demo
+.chroma/
+
+# OS / editor
+.DS_Store
+.pytest_cache/

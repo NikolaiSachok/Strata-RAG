@@ -1,0 +1,89 @@
+# Generic Leak Policy Pack (domain-neutral) — ships in this public repo.
+#
+# Publishable by design: contains NO real brands, paths, identities, or domain tells.
+# Two layers consume it:
+#   * scripts/leak-check.sh    — the deterministic HARD GATE. Owns the literal/regex `grep_patterns`.
+#   * scripts/semantic-audit.py — the SEMANTIC layer. Sends this pack + changed files to an LLM
+#                                 reviewer that hunts the `shapes` / `ambiguous` cases a regex misses.
+#
+# This is the GENERIC pack only. Any domain-specific pack stays PRIVATE and is never merged here.
+
+pack: generic
+description: >
+  Domain-neutral leak categories every public commit must pass: secrets/credentials, real local
+  user/machine paths, PII, explicit DO-NOT-SHIP markers, and "looks-bad-to-publish" asides.
+
+# ---------------------------------------------------------------------------
+# Deterministic seeds — literal/regex tells (the grep hard-gate owns these).
+# Case-insensitive where noted via (?i). STARTING POINTS, not the full limit.
+# ---------------------------------------------------------------------------
+grep_patterns:
+  secrets:
+    - 'AKIA[0-9A-Z]{16}'                      # AWS access key id
+    - 'ASIA[0-9A-Z]{16}'                      # AWS temp key id
+    - '(?i)aws_secret_access_key'
+    - 'sk-[A-Za-z0-9]{20,}'                   # OpenAI-style key
+    - 'sk-ant-[A-Za-z0-9_-]{20,}'             # Anthropic-style key
+    - 'gh[pousr]_[A-Za-z0-9]{30,}'            # GitHub tokens
+    - 'xox[baprs]-[A-Za-z0-9-]{10,}'          # Slack tokens
+    - 'AIza[0-9A-Za-z_-]{35}'                 # Google API key
+    - '-----BEGIN ([A-Z]+ )?PRIVATE KEY-----'
+    - '(?i)(api[_-]?key|secret|password|passwd|token|bearer)\s*[:=]\s*["'']?[A-Za-z0-9_\-./+]{16,}'
+    - '(?i)(postgres|postgresql|mysql|mongodb|redis)://[^\s"'']*:[^\s"''@]+@'  # connection string w/ creds
+  local_paths:
+    - '/Users/[A-Za-z0-9._-]+/'               # macOS home
+    - '/home/[A-Za-z0-9._-]+/'                # linux home
+    - 'C:\\Users\\[^\\]+\\'                    # windows home
+    - '/Volumes/[A-Za-z0-9 ._-]+/'            # mounted volume names
+  pii:
+    - '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}'  # any email (judge: private vs public author identity)
+    - '(\+?\d[\d ().-]{8,}\d)'                          # phone-ish numbers
+  do_not_ship:
+    - '(?i)do[\s_-]*not[\s_-]*(ship|commit)'
+    - '(?i)\bINTERNAL[\s_-]*ONLY\b'
+    - '(?i)\bCONFIDENTIAL\b'
+    - '(?i)TODO:?\s*(remove|delete|strip|redact)\b.*\b(secret|key|token|cred)'
+
+# ---------------------------------------------------------------------------
+# Semantic shapes — described mechanisms a regex won't catch. The LLM hunts these.
+# ---------------------------------------------------------------------------
+shapes:
+  - id: leftover-debug-dump
+    describe: A pasted stack trace, log dump, or console output containing real hostnames, internal
+      service names, user ids, or absolute paths from the author's machine or employer.
+    severity_hint: high
+  - id: identity-deanon
+    describe: Content that ties the public author identity to a separate private/employer identity
+      (e.g. "internally we call this X", a specific company's processes or teammates named).
+    severity_hint: high
+  - id: live-credential
+    describe: A credential or token that looks REAL (high-entropy, correct prefix/shape) rather than
+      an obvious placeholder — even if it sits in a config example.
+    severity_hint: critical
+  - id: embarrassment
+    describe: Self-incriminating asides, vented frustration about a client/employer, or jokes that
+      would embarrass the author if a hostile reader quoted them publicly.
+    severity_hint: medium
+
+# ---------------------------------------------------------------------------
+# Ambiguous / semi-neutral — reads innocuous, but a hostile reader can weaponize it.
+# ---------------------------------------------------------------------------
+ambiguous:
+  - phrasing: A relative path or repo/codename that hints at an internal project or employer.
+    inference: A reader can map the codename to the private employer or project.
+    severity_hint: medium
+  - phrasing: '"for the real corpus" / "the production data" / "our internal dataset" in a repo meant
+      to ship only synthetic samples.'
+    inference: Signals an undisclosed private dataset and that this file was authored against it.
+    severity_hint: medium
+
+# ---------------------------------------------------------------------------
+# Clean contrast — looks similar, genuinely safe. Anti-false-positive guidance.
+# ---------------------------------------------------------------------------
+clean_contrast:
+  - 'A placeholder credential clearly marked as fake: "YOUR_API_KEY_HERE", "sk-xxxxxxxx", "changeme".'
+  - 'Synthetic fixture secrets/emails inside a test suite or sample corpus that EXISTS to exercise a
+     redaction/PII pipeline (reserved TLDs .example/.test/.invalid/.localhost).'
+  - 'A relative, generic project path with no identity: "src/main.py", "./data/sample/doc.txt".'
+  - 'The public author identity the project is MEANT to carry (the author''s own name in LICENSE/README).'
+  - 'Generic example emails: "user@example.com", "you@yourdomain.com".'
