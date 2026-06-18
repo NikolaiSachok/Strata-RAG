@@ -37,12 +37,34 @@ from .config import ROSTER_DIR, SAMPLE_ROSTER_DIR, SETTINGS, Settings, is_sample
 # A source_set maps to a roster FILE by its base FAMILY (the part before the first '-'):
 # every `northwind*` set shares one `northwind.tsv`, every `atlas*` set shares one `atlas.tsv`.
 # Add a family = add one line here; nothing else changes. This is the ONLY place the
-# family→file mapping lives. (A custom corpus registers its own family→stem via this table.)
+# family→file mapping lives. An external overlay extends it via the PUBLIC `register_family()`
+# API below (so it never mutates this dict directly) — see register_family.
 _FAMILY_TO_TSV_STEM: dict[str, str] = {
     # --- synthetic sample corpus (fictional ids/publishers) ---
     "northwind": "northwind",
     "atlas": "atlas",
 }
+
+
+def register_family(family: str, tsv_stem: str) -> None:
+    """Register an external source-set `family` → its roster TSV `tsv_stem` (PUBLIC API).
+
+    This is the roster-side companion to `register_adapter()`: an overlay that adds a corpus
+    family (e.g. a `mycorp` adapter) calls `register_family("mycorp", "mycorp")` so a project
+    in that family joins against `<roster_dir>/mycorp.tsv` for its authoritative publisher —
+    WITHOUT mutating the private `_FAMILY_TO_TSV_STEM` dict directly.
+
+    `family` is matched the same way the loader resolves a source_set: case-insensitively
+    against the part of the source_set before the first '-' (so `mycorp`, `mycorp-extra`, … all
+    share one TSV). `tsv_stem` is the roster file's basename without extension (`mycorp` →
+    `mycorp.tsv`, looked up in the active roster dir). Idempotent/last-wins: re-registering a
+    family replaces its stem. Both args must be non-empty strings (a cheap guard against
+    mis-wiring the seam)."""
+    if not (isinstance(family, str) and family.strip()):
+        raise ValueError(f"register_family expects a non-empty family name, got {family!r}")
+    if not (isinstance(tsv_stem, str) and tsv_stem.strip()):
+        raise ValueError(f"register_family expects a non-empty tsv_stem, got {tsv_stem!r}")
+    _FAMILY_TO_TSV_STEM[family.strip().lower()] = tsv_stem.strip()
 
 # Leading numeric id out of a project_id: "2268"→2268, "northwind/2268"→2268 (the source_set
 # prefix is stripped by callers, but be defensive), "1490-sp08"→1490, "2288_Summit"→2288,

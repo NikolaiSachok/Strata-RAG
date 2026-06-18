@@ -19,7 +19,15 @@ adapter; nothing downstream changes. This is the Strategy pattern, and it's exac
 
 from __future__ import annotations
 
+from ..roster import register_family
 from .base import SourceAdapter, SourceDoc
 from .registry import discover_all, get_adapters, register_adapter
 
-__all__ = ["SourceAdapter", "SourceDoc", "discover_all", "get_adapters", "register_adapter"]
+__all__ = [
+    "SourceAdapter",
+    "SourceDoc",
+    "discover_all",
+    "get_adapters",
+    "register_adapter",
+    "register_family",
+]

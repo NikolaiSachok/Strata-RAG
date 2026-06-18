@@ -18,6 +18,13 @@ EXTENSION SEAM (the important design choice here):
 
     (Deliberately NOT setuptools entry-points — too heavy for an in-repo plugin; the
     try-import-an-optional-module pattern is exactly the right weight here.)
+  * The PUBLIC "bring your own adapters" path: point the `RAGEVAL_PLUGINS_DIR` env var at a
+    directory of plugin modules (`*.py`) that live ENTIRELY OUTSIDE this package. On import we
+    scan that dir and import each module so it can call `register_adapter()` (and
+    `register_family()` from `rageval.sources`) at import time. This lets an external overlay
+    extend the engine to its own corpus with NO file copied into the public package — the
+    open-core extension story without forking. Unset/absent dir → clean no-op (sample-only); a
+    PRESENT-but-broken plugin raises (a real error, never silently swallowed).
 
 This is still the only place that knows the mapping {folder name → adapter class}. Add a new
 corpus = write a SourceAdapter subclass + one `register_adapter(...)` call (in core for a
@@ -87,9 +94,57 @@ def _load_private_plugins() -> None:
     importlib.import_module(f"{__package__}._private_plugins")
 
 
-# Attempt the optional registration once, at import time. By default this is a no-op (module
-# absent); a deployment that ships `_private_plugins.py` can register its own adapters here.
+PLUGINS_DIR_ENV = "RAGEVAL_PLUGINS_DIR"
+
+
+def _load_external_plugins() -> None:
+    """Import every plugin module found in `$RAGEVAL_PLUGINS_DIR`, for its side effects.
+
+    The PUBLIC, fork-free extension path. If `RAGEVAL_PLUGINS_DIR` is set and points at an
+    existing directory, every `*.py` file directly in it (excluding dunder files like
+    `__init__.py`) is imported under a synthetic `rageval_plugin_<name>` module name. Each module
+    is expected to call `register_adapter()` (and optionally `register_family()` from
+    `rageval.sources`) at import time, wiring its own corpus into the engine WITHOUT copying any
+    file into this package.
+
+    Error policy (intentional, mirrors `_load_private_plugins`): an UNSET or NON-EXISTENT dir is a
+    clean no-op (the engine stays sample-only). A PRESENT directory whose plugin fails to import
+    propagates the exception — a present-but-broken plugin is a real wiring error and must NOT be
+    silently skipped (the failure surfaces with the offending file path attached).
+    """
+    import importlib.util
+    import os
+
+    raw = os.environ.get(PLUGINS_DIR_ENV, "").strip()
+    if not raw:
+        return  # unset → sample-only, no-op
+    plugins_dir = Path(raw).expanduser()
+    if not plugins_dir.is_dir():
+        return  # absent dir → no-op (nothing to load)
+
+    # Deterministic order so a plugin set that depends on import order is reproducible.
+    for path in sorted(plugins_dir.glob("*.py")):
+        if path.name.startswith("__"):
+            continue  # skip __init__.py / dunder helpers
+        mod_name = f"rageval_plugin_{path.stem}"
+        spec = importlib.util.spec_from_file_location(mod_name, path)
+        if spec is None or spec.loader is None:  # pragma: no cover - defensive
+            raise ImportError(f"could not load plugin spec from {path}")
+        module = importlib.util.module_from_spec(spec)
+        # No try/except: a broken plugin raises here, with the file in the traceback. We add the
+        # path to the message so the operator knows WHICH plugin is broken.
+        try:
+            spec.loader.exec_module(module)
+        except Exception as exc:  # noqa: BLE001 - re-raise enriched, never swallow
+            raise ImportError(f"failed to import plugin {path}: {exc}") from exc
+
+
+# Attempt the optional registrations once, at import time. By default both are no-ops (the
+# in-package bootstrap module is absent AND RAGEVAL_PLUGINS_DIR is unset) → sample-only. A
+# deployment that ships `_private_plugins.py`, OR points RAGEVAL_PLUGINS_DIR at a dir of plugin
+# modules, registers its own adapters/families here.
 _load_private_plugins()
+_load_external_plugins()
 
 
 def get_adapters(corpus_root: Path) -> list[SourceAdapter]:

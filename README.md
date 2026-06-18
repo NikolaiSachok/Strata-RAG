@@ -135,6 +135,51 @@ metadata sidecar built from a custom corpus are **gitignored** — they're never
 > (non-existent) `…_sample` collection and **fails fast with a clear preflight error** naming the
 > collection and the fix, instead of a cryptic Qdrant 404.
 
+### Custom adapters / plugins (extend the engine without forking)
+A new corpus shape = a new `SourceAdapter` subclass + one `register_adapter(...)` call. You can
+ship those adapters **entirely outside this package** — point `RAGEVAL_PLUGINS_DIR` at a directory
+of adapter modules and the engine imports them on startup so they self-register. No file is copied
+into the package; no fork.
+
+```bash
+RAGEVAL_PLUGINS_DIR=/path/to/my-plugins python -m rageval.ingest --dry-run
+```
+
+Every `*.py` directly in that directory (dunder files like `__init__.py` are skipped) is imported
+once, in filename order, after the in-package plugin bootstrap. Each module registers its corpus at
+**import time** by calling the two public APIs (re-exported from `rageval.sources`):
+
+- `register_adapter("<folder>", YourAdapter)` — maps a source-set **folder** under `corpus_root`
+  to the adapter that discovers its docs (the same key `get_adapters` dispatches on).
+- `register_family("<family>", "<tsv_stem>")` *(optional, only if your corpus has a roster)* —
+  maps a source-set **family** (the part before the first `-`) to a roster TSV stem, so projects
+  in that family join `<roster_dir>/<tsv_stem>.tsv` for their authoritative publisher.
+
+A hypothetical `my-plugins/mycorp_plugin.py`:
+
+```python
+from rageval.sources import register_adapter, register_family
+from rageval.sources.base import SourceAdapter, SourceDoc
+
+class MyCorpAdapter(SourceAdapter):
+    source_set = "mycorp"
+    def discover(self):
+        for project in sorted(self.root.iterdir()):
+            yield SourceDoc(
+                project_id=project.name, source_set=self.source_set,
+                doc_path=project / "description.md", doc_type="description",
+                ext="md", raw_text=(project / "description.md").read_text(),
+            )
+
+register_adapter("mycorp", MyCorpAdapter)       # corpus_root/mycorp/ → MyCorpAdapter
+register_family("mycorp", "mycorp")             # mycorp* families → <roster_dir>/mycorp.tsv
+```
+
+**Error policy:** an unset or non-existent `RAGEVAL_PLUGINS_DIR` is a clean no-op (the engine stays
+sample-only). A **present-but-broken** plugin (a bad import inside it) **raises** with the offending
+file path — a broken plugin is never silently skipped. The in-tree `northwind`/`atlas` sample
+adapters keep working unchanged; this is purely additive.
+
 ### Enrichment concurrency + live progress (long runs)
 The enrichment pass makes **one LLM call per project** (product-name/theme/category extraction).
 Over a large corpus (hundreds of projects) a sequential pass — one ~50 s `claude` call at a time —
