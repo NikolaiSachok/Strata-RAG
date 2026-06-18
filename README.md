@@ -569,6 +569,22 @@ the diff. Job C is the **optional** gate — it uses the `ANTHROPIC_API_KEY` **r
 (Settings → Secrets and variables → Actions) and **skips gracefully when that secret is
 absent**, so CI stays green before the key is configured.
 
+## How this was built
+
+Strata-RAG was built **AI-assisted** (Claude Code) — that's the honest description, not
+hand-written line by line. What's *human-owned* is what makes the engine worth reading: the
+**architecture** (the two-query-class split, eval-first sequencing, the open-core plugin seam),
+the **design decisions** — vector store, embedder, hybrid + rerank, PII backend, top-k policy:
+the *why-X-over-Y* reasoning written up in the
+[wiki](https://github.com/NikolaiSachok/Strata-RAG/wiki) — the **eval + guardrail discipline**
+(Recall@K/nDCG + faithfulness; injection / secret / PII defenses), and the **debugging** behind
+the [Engineering Notes](https://github.com/NikolaiSachok/Strata-RAG/wiki/Engineering-Notes) —
+each a real boundary diagnosed and fixed, not a feature generated.
+
+The point isn't that an AI can emit RAG code; it's the **judgment around it** — what to build,
+what to measure, what to reject, and how to keep a private source corpus from leaking into a
+public repo. The AI accelerated implementation under that direction.
+
 ## License
 
 MIT — see [LICENSE](LICENSE). Author: Nikolai Sachok.
