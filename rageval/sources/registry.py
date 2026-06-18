@@ -139,12 +139,38 @@ def _load_external_plugins() -> None:
             raise ImportError(f"failed to import plugin {path}: {exc}") from exc
 
 
-# Attempt the optional registrations once, at import time. By default both are no-ops (the
-# in-package bootstrap module is absent AND RAGEVAL_PLUGINS_DIR is unset) → sample-only. A
-# deployment that ships `_private_plugins.py`, OR points RAGEVAL_PLUGINS_DIR at a dir of plugin
-# modules, registers its own adapters/families here.
-_load_private_plugins()
-_load_external_plugins()
+# A module-level guard so the optional registrations run EXACTLY ONCE per process, no matter how
+# the loader is reached. The trigger itself lives at the END of `sources/__init__.py` (see
+# `load_optional_plugins`), NOT here at registry-import time: an external plugin follows the
+# documented ergonomic path `from rageval.sources import register_adapter, register_family`, and
+# those facade re-exports are only bound once `__init__.py` has finished importing this module.
+# Running the loader here (mid-`__init__`) would import such a plugin against a half-initialised
+# `rageval.sources` and fail with a circular import. Deferring to the end of `__init__.py` makes
+# the documented import work; the guard makes a standalone `import rageval.sources.registry`
+# (which does NOT re-trigger __init__) safe to combine with the normal package import.
+_plugins_loaded = False
+
+
+def load_optional_plugins() -> None:
+    """Run the optional in-package + external plugin registrations exactly once.
+
+    Called at the very END of `rageval/sources/__init__.py`, after the package facade
+    (`register_adapter`, `register_family`, the adapter classes) is fully bound — so a plugin
+    importing `from rageval.sources import register_adapter, register_family` resolves cleanly.
+
+    By default both steps are no-ops (the in-package bootstrap module is absent AND
+    RAGEVAL_PLUGINS_DIR is unset) → sample-only. A deployment that ships `_private_plugins.py`,
+    OR points RAGEVAL_PLUGINS_DIR at a dir of plugin modules, registers its own adapters/families
+    here. Idempotent: subsequent calls are a no-op (the facade is imported once per process, but
+    importing `registry` standalone must not double-load plugins)."""
+    global _plugins_loaded
+    if _plugins_loaded:
+        return
+    _plugins_loaded = True
+    # In-package bootstrap first, then the external dir — matches the documented order ("after the
+    # in-package plugin bootstrap").
+    _load_private_plugins()
+    _load_external_plugins()
 
 
 def get_adapters(corpus_root: Path) -> list[SourceAdapter]:

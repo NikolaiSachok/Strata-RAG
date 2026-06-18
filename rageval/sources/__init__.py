@@ -31,3 +31,13 @@ __all__ = [
     "register_adapter",
     "register_family",
 ]
+
+# Load optional plugins (in-package bootstrap + $RAGEVAL_PLUGINS_DIR) LAST — only now that every
+# facade name above is bound. An external plugin follows the documented ergonomic import
+# `from rageval.sources import register_adapter, register_family`; triggering the loader earlier
+# (e.g. at registry-import time, mid-`__init__`) would import that plugin against a partially
+# initialised `rageval.sources` and crash with a circular import. The loader is guarded to run
+# exactly once per process.
+from .registry import load_optional_plugins as _load_optional_plugins
+
+_load_optional_plugins()
