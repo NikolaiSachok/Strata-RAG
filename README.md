@@ -576,7 +576,7 @@ hand-written line by line. What's *human-owned* is what makes the engine worth r
 **architecture** (the two-query-class split, eval-first sequencing, the open-core plugin seam),
 the **design decisions** — vector store, embedder, hybrid + rerank, PII backend, top-k policy:
 the *why-X-over-Y* reasoning written up in the
-[wiki](https://github.com/NikolaiSachok/Strata-RAG/wiki) — the **eval + guardrail discipline**
+[Design Decisions](https://github.com/NikolaiSachok/Strata-RAG/wiki/Design-Decisions) wiki page — the **eval + guardrail discipline**
 (Recall@K/nDCG + faithfulness; injection / secret / PII defenses), and the **debugging** behind
 the [Engineering Notes](https://github.com/NikolaiSachok/Strata-RAG/wiki/Engineering-Notes) —
 each a real boundary diagnosed and fixed, not a feature generated.
