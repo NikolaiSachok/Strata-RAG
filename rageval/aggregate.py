@@ -293,7 +293,13 @@ def _run(sidecar_path: Path, sql: str, params: list) -> list[dict]:
     stmt = sql.strip().rstrip(";")
     if ";" in stmt or not re.match(r"(?is)^select\b", stmt):
         raise AggregateError("internal: only single SELECT statements may execute here.")
-    conn = _connect_readonly(Path(sidecar_path))
+    try:
+        # Self-hardened: a connect-time failure (missing file, perms, locked/corrupt DB) raises a
+        # raw sqlite3.Error/OSError BEFORE any query runs. Catch it here too so this layer degrades
+        # to AggregateError on its own — belt-and-braces behind the agent's own catch.
+        conn = _connect_readonly(Path(sidecar_path))
+    except (sqlite3.Error, OSError) as e:
+        raise AggregateError(f"sidecar unavailable: {e}") from e
     try:
         cur = conn.execute(stmt, params)
         return _rows_to_dicts(cur.fetchall())

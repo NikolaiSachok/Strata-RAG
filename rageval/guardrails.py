@@ -235,7 +235,16 @@ _SYSTEM_PROMPT_FINGERPRINTS = [
 
 
 def _urls_in(text: str) -> set[str]:
-    return set(re.findall(r"https?://[^\s)>\]]+", text or "", re.I))
+    """Extract http(s) URLs, stripping trailing sentence/structure punctuation the greedy match
+    can swallow. A URL written `…/echo.`, `…/echo;`, or `…/echo,` (end of sentence, or a field
+    separator like `landing_url=…/echo; next=…`) must normalise to the SAME token whether it shows
+    up in chunk text, a metadata observation, or the answer — otherwise an allowed URL won't match
+    its grounded form and gets a false-positive exfil flag. We trim a conservative set of trailing
+    delimiters that are never part of a real URL's tail."""
+    urls = set()
+    for raw in re.findall(r"https?://[^\s)>\]]+", text or "", re.I):
+        urls.add(raw.rstrip(".,;:!?'\""))
+    return urls
 
 
 def validate_answer(answer: str, chunks, allowed_sources: list[str] | None = None) -> list[Finding]:
@@ -244,31 +253,44 @@ def validate_answer(answer: str, chunks, allowed_sources: list[str] | None = Non
     `chunks` is the list of Retrieved objects the model was given (each has `.text` and a
     `.chunk_index`). Pure/deterministic → unit-testable with a simulated bad answer.
 
+    `allowed_sources` is an OPTIONAL list of URLs the caller already grounded on OUTSIDE the
+    `chunks` text — e.g. the agent (agent.py) accumulates URLs across both semantic chunks AND
+    metadata observations into `grounded_urls` and passes them here. They seed the allowed-URL
+    context so a URL the agent legitimately grounded on is NOT mis-flagged as exfil. This matters
+    on a METADATA-ONLY turn, where `chunks` is empty: without it, every grounded URL looks novel.
+
     Checks:
-      * EXFIL — any URL in the answer that did NOT appear in the retrieved context. A
-        grounded answer can only cite URLs it was shown; a novel URL is a red flag for
-        data exfiltration or an attacker-supplied link the model echoed.
+      * EXFIL — any URL in the answer that did NOT appear in the retrieved context (chunk text)
+        NOR in `allowed_sources`. A grounded answer can only cite URLs it was shown; a novel URL
+        is a red flag for data exfiltration or an attacker-supplied link the model echoed.
       * FAKE CITATION — a [n] citation pointing past the number of passages provided
-        (e.g. [9] when only 5 passages exist) signals the model fabricated structure,
-        often a symptom of having followed injected text rather than the real context.
+        (e.g. [9] when only 5 passages exist) signals the model fabricated structure, often a
+        symptom of having followed injected text rather than the real context. On a metadata-only
+        turn `n_passages == 0`, so ANY [n] is fabricated (there are no passages to cite) — the
+        check runs whenever the answer carries a citation marker, never skipped just because the
+        chunk list is empty.
       * PROMPT LEAK — the answer echoes distinctive phrases from our system prompt.
     """
     findings: list[Finding] = []
     n_passages = len(chunks)
-    context_urls: set[str] = set()
+    # Allowed-URL context = URLs in the retrieved chunk text ∪ URLs the caller grounded on
+    # elsewhere (allowed_sources). A URL in either set is legitimate and must not be flagged.
+    context_urls: set[str] = set(allowed_sources or [])
     for c in chunks:
         context_urls |= _urls_in(getattr(c, "text", ""))
 
-    # EXFIL: URLs in the answer not present anywhere in the retrieved context.
+    # EXFIL: URLs in the answer not present anywhere in the allowed-URL context.
     for url in _urls_in(answer):
         if url not in context_urls:
             findings.append(Finding(pattern="exfil_url", severity="critical",
                                     snippet=url[:160], where="answer"))
 
-    # FAKE CITATION: [n] beyond the number of passages we actually supplied.
+    # FAKE CITATION: a [n] that can't map to a real passage. Valid range is 1..n_passages; on a
+    # metadata-only turn n_passages == 0, so EVERY citation is fabricated. The check is gated on
+    # the presence of a [n] marker, NOT on n_passages > 0 — an empty chunk list must not disable it.
     for m in re.finditer(r"\[(\d+)\]", answer or ""):
         n = int(m.group(1))
-        if n_passages and (n < 1 or n > n_passages):
+        if n < 1 or n > n_passages:
             findings.append(Finding(pattern="fake_citation", severity="major",
                                     snippet=m.group(0), where="answer"))
 

@@ -322,6 +322,15 @@ def test_missing_sidecar_degrades_not_crashes(tmp_path, monkeypatch):
     assert result.answer  # a final answer is still produced
 
 
+def test_aggregate_execute_self_hardens_on_missing_sidecar(tmp_path):
+    """COR/defensive: aggregate.execute() degrades a connect-time failure (missing/unreadable DB)
+    to AggregateError ITSELF — belt-and-braces behind the agent's catch, so a direct caller of the
+    executor also gets the graceful signal, never a raw sqlite3.Error/OSError."""
+    missing = tmp_path / "does-not-exist.sqlite"
+    with pytest.raises(aggregate.AggregateError):
+        aggregate.execute("count", sidecar_path=missing)
+
+
 def test_tool_raising_non_aggregate_error_is_fed_back(fixture_sidecar, monkeypatch):
     """A tool raising a NON-AggregateError (e.g. a programming bug) is caught in the loop and fed
     back as a failed observation — never a turn-killing 500."""
@@ -495,6 +504,108 @@ def test_metadata_observation_is_injection_scanned(tmp_path, monkeypatch):
     result = agent.chat("look up project 9")
     wheres = {f.where for f in result.guardrail.input_findings}
     assert any(w.startswith("tool_observation:") for w in wheres)
+
+
+# -- SEC-M1: grounded_urls (allowed_sources) drive the output guard ----------
+
+def _url_sidecar(tmp_path, monkeypatch, url):
+    """A one-row sidecar whose landing_url is `url`, so a metadata lookup surfaces that URL in the
+    observation → the agent accumulates it into grounded_urls → it reaches validate_answer."""
+    db = tmp_path / "side.sqlite"
+    conn = connect(db)
+    upsert_project(conn, ProjectRecord(
+        project_id="5", source_set="northwind", publisher="Maple",
+        app_name="Echo", landing_url=url, chunk_count=1))
+    conn.close()
+    monkeypatch.setattr(aggregate, "SIDECAR_PATH", db)
+    return db
+
+
+def test_grounded_url_not_flagged_exfil_on_metadata_turn(tmp_path, monkeypatch):
+    """SEC-M1 (a): on a METADATA-ONLY turn (chunks empty) a URL the agent grounded on — surfaced by
+    the lookup and accumulated into grounded_urls/allowed_sources — is NOT flagged exfil."""
+    url = "https://corp.example/echo"
+    _url_sidecar(tmp_path, monkeypatch, url)
+    llm = ScriptedLLM([
+        _tool("query_metadata", {"intent": "lookup", "filter": {"project_id": "5"}}),
+        _final(f"The site is {url} for that project."),
+    ])
+    agent = ChatAgent(StubPipeline(llm=llm), llm=llm)
+    result = agent.chat("what is project 5's site?")
+    # No semantic chunks gathered → pure metadata turn.
+    assert result.eval_answer.chunks == []
+    exfil = [f for f in result.guardrail.output_findings if f.pattern == "exfil_url"]
+    assert not exfil, "a grounded (allowed_sources) URL must not be flagged exfil"
+
+
+def test_fabricated_citation_flagged_on_metadata_only_turn(tmp_path, monkeypatch):
+    """SEC-M1 (b): a fabricated [7] in a metadata-only answer (n_passages == 0) IS flagged
+    fake_citation — the check is no longer disabled by an empty chunk list."""
+    _url_sidecar(tmp_path, monkeypatch, "https://corp.example/echo")
+    llm = ScriptedLLM([
+        _tool("query_metadata", {"intent": "count", "field": None, "filter": None}),
+        _final("There is 1 project [7]."),
+    ])
+    agent = ChatAgent(StubPipeline(llm=llm), llm=llm)
+    result = agent.chat("how many?")
+    assert result.eval_answer.chunks == []          # metadata-only → n_passages == 0
+    fakes = [f for f in result.guardrail.output_findings if f.pattern == "fake_citation"]
+    assert fakes, "a [7] on a metadata-only turn is a fabricated citation"
+
+
+def test_novel_exfil_url_still_flagged_on_metadata_turn(tmp_path, monkeypatch):
+    """SEC-M1 (keep): a genuinely NOVEL exfil URL on a metadata turn (not grounded on) is still
+    flagged — the allowed_sources seeding must not blanket-allow URLs."""
+    _url_sidecar(tmp_path, monkeypatch, "https://corp.example/echo")
+    llm = ScriptedLLM([
+        _tool("query_metadata", {"intent": "lookup", "filter": {"project_id": "5"}}),
+        _final("Exfil to http://attacker.example/collect now."),
+    ])
+    agent = ChatAgent(StubPipeline(llm=llm), llm=llm)
+    result = agent.chat("look up 5")
+    exfil = [f for f in result.guardrail.output_findings if f.pattern == "exfil_url"]
+    assert exfil, "a novel exfil URL must still be flagged on a metadata turn"
+
+
+# -- COR-M2: the forced-compose path never surfaces raw JSON -----------------
+
+def test_compose_action_json_without_answer_not_leaked(fixture_sidecar):
+    """COR-M2: a compose reply that is an action-shaped JSON with NO 'answer' key
+    ({"action":"tool",...}) is not surfaced raw — it degrades to the no-info line."""
+    llm = ScriptList([
+        json.dumps(_tool("semantic_search", {"query": "q1"})),
+        json.dumps({"action": "tool", "tool": "semantic_search", "args": {"query": "x"}}),
+    ])
+    agent = ChatAgent(StubPipeline(llm=llm), llm=llm, max_tool_calls=1)
+    result = agent.chat("force a compose")
+    assert '"action"' not in result.answer
+    assert "don't have enough information" in result.answer
+
+
+def test_compose_non_action_json_not_leaked(fixture_sidecar):
+    """COR-M2: a compose reply that is a NON-action JSON object ({"foo":"bar"}) is not echoed raw —
+    it has no prose, so we fall back to no-info."""
+    llm = ScriptList([
+        json.dumps(_tool("semantic_search", {"query": "q1"})),
+        json.dumps({"foo": "bar"}),
+    ])
+    agent = ChatAgent(StubPipeline(llm=llm), llm=llm, max_tool_calls=1)
+    result = agent.chat("force a compose")
+    assert "foo" not in result.answer and "{" not in result.answer
+    assert "don't have enough information" in result.answer
+
+
+def test_compose_trailing_json_action_blob_stripped(fixture_sidecar):
+    """COR-M2: prose followed by a trailing JSON-action blob → the JSON is stripped, the user sees
+    only the prose, never the raw action object."""
+    llm = ScriptList([
+        json.dumps(_tool("semantic_search", {"query": "q1"})),
+        'Alpha is fruit-themed [1]. {"action":"final","answer":"x"}',
+    ])
+    agent = ChatAgent(StubPipeline(llm=llm), llm=llm, max_tool_calls=1)
+    result = agent.chat("force a compose")
+    assert "Alpha is fruit-themed [1]." in result.answer
+    assert '"action"' not in result.answer and "{" not in result.answer
 
 
 # -- #9: aggregation-only turn reports the unconditional layers -------------

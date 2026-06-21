@@ -640,13 +640,55 @@ class ChatAgent:
         except Exception:  # noqa: BLE001
             text = ""
         text = (text or "").strip()
-        # #5 BELT-AND-BRACES: the compose prompt forbids JSON, but if a misbehaving model returns
-        # an action object anyway, parse the answer out rather than surfacing raw JSON to the user.
-        if text.startswith("{") or "```" in text:
-            parsed = _parse_action(text)
-            if isinstance(parsed.get("answer"), str):
-                text = parsed["answer"].strip()
-        return text or _NO_INFO
+        # #5 / COR-M2 BELT-AND-BRACES: the compose prompt forbids JSON, but a misbehaving model can
+        # still emit JSON. We must NEVER surface raw JSON (action-shaped or otherwise) to the user:
+        #   * a {"action": "final", "answer": "x"} blob → recover the prose answer "x";
+        #   * any other JSON-action shape (a dict with an "action" key but NO usable answer, e.g.
+        #     {"action":"tool",...}) → fall back to no-info rather than echo the action;
+        #   * a non-action JSON object ({"foo":"bar"}) → also not prose; fall back to no-info;
+        #   * prose with a TRAILING JSON blob ('answer. {"action":...}') → strip the JSON, keep prose.
+        return _strip_compose_json(text) or _NO_INFO
+
+
+def _strip_compose_json(text: str) -> str:
+    """COR-M2: ensure a forced-compose reply never surfaces raw JSON to the user.
+
+    The compose prompt forbids JSON, but a misbehaving model can ignore that. We classify the
+    reply and return only safe PROSE:
+      * A JSON-ACTION shape (a dict with an "action" key): if it carries a usable string `answer`
+        ({"action":"final","answer":"x"}) we recover that answer; otherwise ({"action":"tool",...})
+        the action is not an answer → return "" (the caller degrades to _NO_INFO).
+      * Any OTHER top-level JSON object/array ({"foo":"bar"}, [...]) is non-prose → return "".
+      * Prose with a TRAILING (or embedded) JSON-action blob ('answer. {"action":...}') → strip the
+        JSON span so the user sees only the prose.
+      * Plain prose → returned unchanged.
+    """
+    text = (text or "").strip()
+    if not text:
+        return ""
+
+    # Whole reply is (or wraps) a JSON object/array — never show it verbatim.
+    looks_jsonish = text.startswith(("{", "[")) or "```" in text
+    if looks_jsonish:
+        parsed = _parse_action(text)
+        if isinstance(parsed, dict) and isinstance(parsed.get("answer"), str):
+            return parsed["answer"].strip()
+        # An action with no answer, or non-action JSON → no prose to surface.
+        return ""
+
+    # Prose that contains a trailing/embedded JSON blob: strip the first balanced JSON object so
+    # the raw action never reaches the user, keeping the surrounding prose.
+    decoder = json.JSONDecoder()
+    idx = text.find("{")
+    while idx != -1:
+        try:
+            _obj, end = decoder.raw_decode(text, idx)
+        except json.JSONDecodeError:
+            idx = text.find("{", idx + 1)
+            continue
+        stripped = (text[:idx] + text[end:]).strip()
+        return stripped
+    return text
 
 
 def _dedupe(items: list[str]) -> list[str]:
