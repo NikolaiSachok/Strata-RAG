@@ -333,3 +333,30 @@ def test_routing_block_shape_is_json_serializable(fixture_sidecar, monkeypatch):
     blob = json.dumps(ans.routing)
     back = json.loads(blob)
     assert set(["route", "confidence", "reasoning", "method", "executed_route", "fell_back"]) <= set(back)
+
+
+# ===========================================================================
+# 5. Route-aware eval end-to-end (issue #16): a DISPATCHED aggregation answer,
+#    graded by the REAL Judge, must PASS — not fail on a bogus faithfulness flag.
+# ===========================================================================
+
+def test_dispatched_aggregation_answer_passes_judge(fixture_sidecar, monkeypatch):
+    """The bug: the judge scored a sidecar aggregation answer faithfulness:critical (empty
+    CONTEXT) and FAILED it. End-to-end: dispatch an aggregation, then run the route-aware Judge
+    with a scripted relevance verdict — faithfulness is skipped and the answer passes."""
+    from rageval.eval import NOT_APPLICABLE, Judge
+
+    _monkeypatch_sidecar(monkeypatch, fixture_sidecar)
+    router_llm = FakeRouterLLM({"route": "aggregation", "confidence": 0.95, "reasoning": "count",
+                                "intent": "group_by_count", "field": "publisher", "filter": None})
+    pipe = StubPipeline(llm=router_llm)
+    ans = dispatch("how many projects per publisher?", pipe, use_rules=False)
+    assert ans.routing["executed_route"] == "aggregation"
+    assert ans.sources == []  # the sidecar answered — empty sources is CORRECT here
+
+    judge_llm = FakeRouterLLM(
+        {"answer_relevance": {"score": 5, "severity": "none", "reason": "Answers it."},
+         "findings": []})
+    verdict = Judge(llm=judge_llm).evaluate(ans)
+    assert verdict.faithfulness.severity == NOT_APPLICABLE
+    assert verdict.overall_pass is True
