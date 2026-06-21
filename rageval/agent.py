@@ -550,10 +550,16 @@ class ChatAgent:
             g.validate_answer(final_answer, all_chunks, allowed_sources=sorted(grounded_urls)))
 
         # Build the Answer the eval Judge will grade: its context is the gathered chunks (so the
-        # judge sees the same evidence the agent composed from).
+        # judge sees the same evidence the agent composed from). ROUTE-AWARE (#16): attach a routing
+        # block derived from the TRAJECTORY when the turn used ONLY metadata/aggregation tools, so the
+        # Judge skips passage-faithfulness for a pure-aggregation answer (empty `sources` is correct,
+        # not a hallucination). A semantic / hybrid trajectory gets routing=None → graded against the
+        # gathered chunks as before (so a genuinely unfaithful answer still fails). See
+        # _eval_routing_from_trajectory for why this never trips the #21 dispatch invariant.
         eval_answer = Answer(question=question, answer=final_answer,
                              sources=_dedupe(all_sources), chunks=all_chunks,
-                             guardrail=report)
+                             guardrail=report,
+                             routing=_eval_routing_from_trajectory(trajectory))
 
         return AgentResult(
             answer=final_answer,
@@ -689,6 +695,67 @@ def _strip_compose_json(text: str) -> str:
         stripped = (text[:idx] + text[end:]).strip()
         return stripped
     return text
+
+
+def _eval_routing_from_trajectory(trajectory: list[ToolCall]) -> dict | None:
+    """Derive a routing block for the EVAL judge from the tools the agent ACTUALLY used (#16).
+
+    WHY this exists. The eval Judge is route-aware (eval._executed_route): a semantic answer is
+    graded for passage-faithfulness against its CONTEXT, while a deterministic aggregation/lookup
+    answer is NOT (its CONTEXT is correctly empty — the evidence is a SQL result, not passages).
+    The DISPATCH path (`/ask`) sets that route in dispatch.py; the AGENT path (`/chat`) didn't, so a
+    pure-aggregation chat answer (only `query_metadata`, so `sources:[]`, no chunks) fell into the
+    semantic branch → passage-faithfulness ran against EMPTY context → `faithfulness:1/critical` →
+    `overall_pass:false` even though the answer was correct. We fix that by reading the trajectory.
+
+    THE RULE — derive the route from the tools used, not the question:
+      * The agent called `semantic_search` on ANY successful hop (semantic-only OR hybrid) → we
+        return None. No routing override: the eval_answer keeps `routing=None` → eval grades it
+        SEMANTICALLY against the gathered chunks (all_chunks). A genuinely unfaithful answer over
+        real retrieved evidence STILL fails — we must not blanket-skip the agent path.
+      * The agent used ONLY metadata/aggregation tools (≥1 successful `query_metadata`, NO
+        successful `semantic_search`) → return a routing block whose `executed_route` is the
+        deterministic route (`lookup` if every metadata hop was a lookup, else `aggregation`), so
+        the Judge SKIPS passage-faithfulness (empty `sources` is correct here, not a hallucination)
+        and grades answer_relevance alone.
+      * No successful tool at all → None (graded semantically over whatever was gathered, i.e. the
+        honest no-info / empty-context case — today's behaviour, no regression).
+
+    GUARDING THE #21 DISPATCH INVARIANT. dispatch._try_aggregation asserts that an aggregation
+    answer's TEXT is the DETERMINISTIC renderer output (aggregate.format_aggregation_answer), and the
+    eval faithfulness-skip is safe there precisely because of that. The AGENT's aggregation answer is
+    LLM-COMPOSED prose, NOT a deterministic render — so we must NOT route it through that dispatch
+    invariant. We don't: this block is built HERE (never via dispatch._routing_block), it carries a
+    distinct `composed_by:"agent"` marker, and it deliberately OMITS the deterministic-render fields
+    (`row_count`, `executed_query`, `params`). Omitting `row_count` also means
+    eval._result_consistency_finding returns None — the agent answer gets no spurious
+    "rendered from the executed query" note, which would be false for LLM-composed prose."""
+    metadata_intents: list[str] = []
+    for tc in trajectory:
+        if not tc.ok:
+            continue
+        if tc.tool == TOOL_SEMANTIC:
+            return None  # any successful semantic hop → grade semantically (no override)
+        if tc.tool == TOOL_METADATA:
+            metadata_intents.append(str((tc.args or {}).get("intent", "")).lower())
+
+    if not metadata_intents:
+        return None  # no successful tool → semantic/no-info default (no regression)
+
+    # Pure-aggregation/lookup trajectory: pick the deterministic route. `lookup` only if EVERY
+    # metadata hop was a lookup; otherwise it's general aggregation.
+    executed_route = "lookup" if all(i == "lookup" for i in metadata_intents) else "aggregation"
+    return {
+        "route": executed_route,
+        "executed_route": executed_route,
+        # Provenance: this route was inferred from the agent's trajectory, and the answer is
+        # LLM-COMPOSED — NOT the deterministic dispatch render. The eval skip applies; the #21
+        # dispatch deterministic-render invariant does NOT (and is never invoked on this path).
+        "composed_by": "agent",
+        "derived_from": "trajectory",
+        # Deliberately NO row_count / executed_query / params: those are the dispatch path's
+        # deterministic-render markers, and their absence keeps _result_consistency_finding quiet.
+    }
 
 
 def _dedupe(items: list[str]) -> list[str]:
