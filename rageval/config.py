@@ -39,11 +39,10 @@ SAMPLE_CORPUS_DIR = PROJECT_ROOT / "data" / "sample"  # the synthetic, committed
 #
 # Read at IMPORT time so the module-level path constants below — used as default params like
 # `def connect(path=SIDECAR_PATH)` — reflect the override.
-DATA_DIR = (
-    Path(os.environ["RAGEVAL_DATA_DIR"]).expanduser().resolve()
-    if os.environ.get("RAGEVAL_DATA_DIR")
-    else PROJECT_ROOT
-)
+# `.strip()` so an empty OR whitespace-only env value falls back to PROJECT_ROOT, rather than a
+# truthy "   " resolving to a literal-space dir (the classic empty-env footgun).
+_data_dir_env = os.environ.get("RAGEVAL_DATA_DIR", "").strip()
+DATA_DIR = Path(_data_dir_env).expanduser().resolve() if _data_dir_env else PROJECT_ROOT
 
 # Roster TSVs (project-id → authoritative publisher; see roster.py). The synthetic sample
 # rosters (data/sample/*.tsv) ship with the repo. The loader is GENERIC and degrades to null

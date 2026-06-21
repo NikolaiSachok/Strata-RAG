@@ -129,3 +129,15 @@ def test_roster_falls_back_to_data_dir_when_only_data_dir_set(tmp_path):
     # No explicit roster override → Settings.roster_dir is empty (roster.py derives from ROSTER_DIR).
     assert cfg["roster_dir_setting"] == ""
     assert cfg["ROSTER_DIR"] == str(data_dir.resolve() / "data")
+
+
+# --- empty / whitespace env → fall back to PROJECT_ROOT (the classic empty-env bug) ----
+
+def test_empty_or_whitespace_env_falls_back_to_project_root():
+    """An empty or whitespace-only RAGEVAL_DATA_DIR must fall back to PROJECT_ROOT — NOT resolve to
+    CWD or a literal-space directory. This is the single most important edge case for an env path."""
+    root = _resolve_config()["PROJECT_ROOT"]
+    for val in ("", "   "):
+        cfg = _resolve_config(RAGEVAL_DATA_DIR=val)
+        assert cfg["DATA_DIR"] == root, f"{val!r} should fall back to PROJECT_ROOT"
+        assert cfg["SIDECAR_PATH"] == str(Path(root) / "rageval.sqlite")
