@@ -127,6 +127,29 @@ curl -s localhost:8000/ask -H 'content-type: application/json' \
   -d '{"question": "Which project is a budgeting app and what is its theme?"}' | python -m json.tool
 ```
 
+### Web UI (optional)
+A thin [Streamlit](https://streamlit.io) front end (`rageval/ui.py`) lets you *see* the engine
+instead of reading JSON. It is a UI **over** the running API (it POSTs to `/chat` and renders what
+comes back) — it holds **no** retrieval/eval/agent logic of its own. Beyond the answer + cited
+sources it surfaces the engine's distinctive signals, each expandable: the **routing** (which path
+/ tools answered, and whether the turn was *hybrid*), the agent's **trajectory** (each tool call as
+a "show your work" timeline), the **eval** verdict (faithfulness + answer-relevance with a
+green/red `overall_pass` badge), and the **guardrail** report (which layers fired, `safe`, any
+findings). It is **multi-turn**: the conversation history lives in `st.session_state` and is replayed
+to the stateless `/chat` on every turn.
+
+```bash
+pip install -e ".[ui]"                 # streamlit is an OPT-IN extra, not a core dep
+uvicorn rageval.api:app                # terminal 1 — the engine
+streamlit run rageval/ui.py            # terminal 2 — the UI  (or: python -m streamlit run rageval/ui.py)
+```
+
+Point it at a non-default backend with the **`RAGEVAL_API_URL`** env var (default
+`http://localhost:8000`) or the sidebar's *API base URL* field; the sidebar also shows a small
+`/health` line (backend + `chunks_indexed`). The HTTP call and the response→view-model shaping are
+factored into plain functions, [unit-tested](tests/test_ui.py) with a mocked transport — no running
+server or browser needed.
+
 ### Point it at your own corpus
 The engine never copies your corpus into the repo. Set the root and (if needed) the intent:
 
