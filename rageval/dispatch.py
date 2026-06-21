@@ -29,27 +29,10 @@ from .generate import Answer, RagPipeline
 from .router import RouteDecision
 
 
-def _format_aggregation_answer(result: aggregate.AggregateResult) -> str:
-    """Render a templated-query result into a short human answer string. Kept simple and
-    deterministic (no LLM): the structured rows + the routing block carry the real detail."""
-    rows = result.rows
-    if result.intent == "count":
-        n = rows[0].get("count") if rows else 0
-        return f"Count: {n}."
-    if result.intent in ("group_by_count", "top_n"):
-        parts = [f"{r.get(k)}: {r.get('count')}" for r in rows for k in r if k != "count"]
-        body = "; ".join(parts) if parts else "no rows"
-        label = "Top results" if result.intent == "top_n" else "Grouped counts"
-        return f"{label} — {body}."
-    if result.intent == "list":
-        # The single non-derived column holds the distinct values.
-        vals = [str(next(iter(r.values()))) for r in rows]
-        return "Distinct values: " + (", ".join(vals) if vals else "(none).")
-    if result.intent == "lookup":
-        if not rows:
-            return "No matching record."
-        return "Record: " + "; ".join(f"{k}={v}" for k, v in rows[0].items())
-    return f"{len(rows)} row(s)."  # pragma: no cover
+# Back-compat alias: the renderer moved to aggregate.format_aggregation_answer (its natural
+# home next to AggregateResult; the agent also composes aggregation observations). Kept as a
+# module-local name so existing references/tests in dispatch keep working.
+_format_aggregation_answer = aggregate.format_aggregation_answer
 
 
 def _routing_block(decision: RouteDecision, *,

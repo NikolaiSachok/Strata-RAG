@@ -70,6 +70,32 @@ class AggregateError(RuntimeError):
     treats this as a signal to FALL BACK to the semantic path, not as a fatal error."""
 
 
+def format_aggregation_answer(result: "AggregateResult") -> str:
+    """Render a templated-query result into a short human answer string. Kept simple and
+    deterministic (no LLM): the structured rows + the routing block carry the real detail.
+
+    Public (was dispatch._format_aggregation_answer): both dispatch.py and the agent compose
+    aggregation observations, so it lives here next to AggregateResult — its natural home."""
+    rows = result.rows
+    if result.intent == "count":
+        n = rows[0].get("count") if rows else 0
+        return f"Count: {n}."
+    if result.intent in ("group_by_count", "top_n"):
+        parts = [f"{r.get(k)}: {r.get('count')}" for r in rows for k in r if k != "count"]
+        body = "; ".join(parts) if parts else "no rows"
+        label = "Top results" if result.intent == "top_n" else "Grouped counts"
+        return f"{label} — {body}."
+    if result.intent == "list":
+        # The single non-derived column holds the distinct values.
+        vals = [str(next(iter(r.values()))) for r in rows]
+        return "Distinct values: " + (", ".join(vals) if vals else "(none).")
+    if result.intent == "lookup":
+        if not rows:
+            return "No matching record."
+        return "Record: " + "; ".join(f"{k}={v}" for k, v in rows[0].items())
+    return f"{len(rows)} row(s)."  # pragma: no cover
+
+
 @dataclass
 class AggregateResult:
     """The outcome of one templated query — enough to render AND to audit (transparency)."""

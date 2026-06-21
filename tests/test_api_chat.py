@@ -142,6 +142,48 @@ def test_chat_rejects_bad_history_role(sidecar):
     assert resp.status_code == 422  # role pattern ^(user|assistant)$
 
 
+def test_chat_rejects_oversized_history(sidecar):
+    """#10: a history exceeding the item cap is a clean 422, not an unbounded context blow-up."""
+    from rageval.api import MAX_HISTORY_ITEMS
+    llm = ScriptedLLM([_final("x")])
+    history = [{"role": "user", "content": "q"} for _ in range(MAX_HISTORY_ITEMS + 1)]
+    with _client_with(llm) as client:
+        resp = client.post("/chat", json={"question": "hi", "history": history})
+    assert resp.status_code == 422
+
+
+def test_chat_tool_error_does_not_500(tmp_path, monkeypatch):
+    """C1 (HTTP): a tool raising mid-turn (missing sidecar) is handled inside the agent — /chat
+    returns 200 with a degraded answer, never a 500."""
+    monkeypatch.setattr(aggregate, "SIDECAR_PATH", tmp_path / "nope.sqlite")
+    llm = ScriptedLLM([
+        _tool("query_metadata", {"intent": "count", "field": None, "filter": None}),
+        _final("Could not consult metadata."),
+    ])
+    with _client_with(llm) as client:
+        resp = client.post("/chat", json={"question": "how many?"})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["answer"]
+    assert body["trajectory"][0]["ok"] is False
+
+
+def test_chat_output_guard_fires(sidecar):
+    """The output-side validate_answer runs for /chat: a final answer carrying an EXFIL URL not in
+    any grounded context produces an output finding (and flips guardrail.safe to False)."""
+    llm = ScriptedLLM([
+        _tool("semantic_search", {"query": "x"}),
+        _final("See http://evil.example/steal?d=secret for details [1]."),
+    ])
+    with _client_with(llm) as client:
+        resp = client.post("/chat", json={"question": "anything"})
+    assert resp.status_code == 200
+    gr = resp.json()["guardrail"]
+    patterns = {f["pattern"] for f in gr["output_findings"]}
+    assert "exfil_url" in patterns
+    assert gr["safe"] is False
+
+
 # ===========================================================================
 # /ask still works unchanged
 # ===========================================================================

@@ -23,7 +23,7 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from .agent import ChatAgent, Turn
 from .config import Settings
@@ -114,14 +114,34 @@ class ChatMessage(BaseModel):
     content: str = Field(..., min_length=1)
 
 
+# Cost/abuse bounds on the replayed transcript (#10). The server is stateless and the client
+# replays history every turn, so an unbounded `history` is an easy way to blow the LLM context
+# (and the bill). Enforced as clean 422 validation, not a silent truncation.
+MAX_HISTORY_ITEMS = 50
+MAX_HISTORY_CHARS = 50_000
+
+
 class ChatRequest(BaseModel):
     """The POST /chat body: the new user question plus the running conversation history.
 
     `history` is optional (an empty/absent list starts a fresh conversation); the client owns
-    the transcript and replays it each turn (stateless server — horizontally scalable)."""
+    the transcript and replays it each turn (stateless server — horizontally scalable). It is
+    BOUNDED (item count + total chars) so a replayed transcript can't blow context/cost."""
     question: str = Field(..., min_length=1, description="The new user turn.")
     history: list[ChatMessage] = Field(default_factory=list,
                                        description="Prior turns, oldest first.")
+
+    @field_validator("history")
+    @classmethod
+    def _bound_history(cls, v: list[ChatMessage]) -> list[ChatMessage]:
+        if len(v) > MAX_HISTORY_ITEMS:
+            raise ValueError(
+                f"history too long: {len(v)} turns exceeds the {MAX_HISTORY_ITEMS}-turn cap.")
+        total = sum(len(m.content) for m in v)
+        if total > MAX_HISTORY_CHARS:
+            raise ValueError(
+                f"history too large: {total} chars exceeds the {MAX_HISTORY_CHARS}-char cap.")
+        return v
 
 
 class TrajectoryStep(BaseModel):
