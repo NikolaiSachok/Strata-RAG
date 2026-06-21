@@ -9,7 +9,9 @@ WHY FastAPI for an LLM service:
 
 The endpoint contract:
   GET  /health  → backend + index status (no LLM call)
-  POST /ask     → {question} → {answer, sources, eval}
+  POST /ask     → {question} → {answer, sources, eval}  (single-shot router; issue #4)
+  POST /chat    → {question, history?} → {answer, sources, trajectory, routing, eval,
+                  guardrail}  (multi-turn agent over the router; issue #5)
 
 The whole RAG + eval flow is assembled once at startup (loading the embedding model
 and opening the vector store is expensive) and reused across requests via FastAPI's
@@ -23,6 +25,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
+from .agent import ChatAgent, Turn
 from .config import Settings
 from .dispatch import dispatch
 from .eval import EvalResult, Judge
@@ -103,6 +106,51 @@ class AskResponse(BaseModel):
     routing: RoutingModel | None = None
 
 
+# ---- /chat (issue #5): the multi-turn agent over the router ----------------
+
+class ChatMessage(BaseModel):
+    """One prior conversation turn the client passes back so follow-ups resolve in context."""
+    role: str = Field(..., pattern="^(user|assistant)$", description="'user' or 'assistant'.")
+    content: str = Field(..., min_length=1)
+
+
+class ChatRequest(BaseModel):
+    """The POST /chat body: the new user question plus the running conversation history.
+
+    `history` is optional (an empty/absent list starts a fresh conversation); the client owns
+    the transcript and replays it each turn (stateless server — horizontally scalable)."""
+    question: str = Field(..., min_length=1, description="The new user turn.")
+    history: list[ChatMessage] = Field(default_factory=list,
+                                       description="Prior turns, oldest first.")
+
+
+class TrajectoryStep(BaseModel):
+    """One step the agent took — the TRANSPARENCY record of how the answer was derived.
+
+    `extra=allow` keeps it forward-compatible if a tool adds a field; the core shape is fixed."""
+    model_config = {"extra": "allow"}
+
+    tool: str
+    args: dict
+    result_summary: str
+    thought: str = ""
+    ok: bool = True
+
+
+class ChatResponse(BaseModel):
+    """What POST /chat returns: the composed grounded answer, its sources, the eval verdict, the
+    merged guardrail report, AND the agent's trajectory (the ordered tool calls) so the client
+    can see exactly how the answer was derived. `routing` summarises the agent's plan (the tools
+    it used) — the multi-step analogue of /ask's single routing block."""
+    question: str
+    answer: str
+    sources: list[str]
+    trajectory: list[TrajectoryStep]
+    routing: dict
+    eval: EvalModel
+    guardrail: GuardrailModel
+
+
 # ---------------------------------------------------------------------------
 # App + lifespan (build the heavy objects once).
 # ---------------------------------------------------------------------------
@@ -111,6 +159,7 @@ class AskResponse(BaseModel):
 class _State:
     pipeline: RagPipeline | None = None
     judge: Judge | None = None
+    agent: ChatAgent | None = None
 
 
 state = _State()
@@ -125,12 +174,14 @@ async def lifespan(app: FastAPI):
     settings = Settings.load()
     try:
         state.pipeline = RagPipeline(settings)
-        # Reuse the pipeline's LLM backend for the judge to avoid a second init.
+        # Reuse the pipeline's LLM backend for the judge + agent to avoid a second init.
         state.judge = Judge(settings, llm=state.pipeline.llm)
+        state.agent = ChatAgent(state.pipeline)
     except LLMError:
-        # No backend yet — leave them None; /ask will return a clear 503.
+        # No backend yet — leave them None; /ask and /chat return a clear 503.
         state.pipeline = None
         state.judge = None
+        state.agent = None
     except CollectionMissingError as e:
         # The target collection doesn't exist (corpus/collection mismatch — e.g. ingested the real
         # corpus but started without RAGENGINE_CORPUS_ROOT, so the name fell back to `..._sample`).
@@ -205,4 +256,55 @@ def ask(req: AskRequest) -> AskResponse:
         eval=verdict.to_dict(),  # type: ignore[arg-type]  (validated by EvalModel)
         guardrail=answer.guardrail.to_dict(),  # type: ignore[arg-type]  (validated by GuardrailModel)
         routing=answer.routing,  # type: ignore[arg-type]  (validated by RoutingModel; None ok)
+    )
+
+
+def _agent_routing_summary(result) -> dict:
+    """Summarise the agent's PLAN for the routing block — the multi-step analogue of /ask's
+    single routing decision. Records which tools ran and how many hops, so a client gets the
+    same 'how was this served' transparency at the conversation level."""
+    tools_used = [t.tool for t in result.trajectory]
+    return {
+        "mode": "agent",
+        "tool_calls": len(result.trajectory),
+        "tools_used": tools_used,
+        # 'hybrid' iff the agent chained BOTH engines in one turn (the multi-hop decomposition).
+        "hybrid": ("semantic_search" in tools_used and "query_metadata" in tools_used),
+    }
+
+
+@app.post("/chat", response_model=ChatResponse)
+def chat(req: ChatRequest) -> ChatResponse:
+    """The MULTI-TURN agentic endpoint (issue #5): the agent decomposes the question into one
+    or more tool calls (semantic search and/or the metadata sidecar), chains them as needed,
+    and composes ONE grounded, cited answer — carrying prior `history` so follow-ups resolve in
+    context. Returns the answer, sources, the eval verdict, the merged guardrail report, AND the
+    agent's trajectory (the ordered tool calls) so the derivation is fully auditable."""
+    if state.agent is None or state.judge is None:
+        # Backend wasn't available at startup — re-resolve to produce the precise reason.
+        try:
+            settings = Settings.load()
+            state.pipeline = RagPipeline(settings)
+            state.judge = Judge(settings, llm=state.pipeline.llm)
+            state.agent = ChatAgent(state.pipeline)
+        except LLMError as e:
+            raise HTTPException(status_code=503, detail=str(e)) from e
+
+    try:
+        history = [Turn(role=m.role, content=m.content) for m in req.history]
+        result = state.agent.chat(req.question, history=history)
+        # The agent hands us an Answer (eval_answer) whose context is the gathered evidence, so
+        # the EXISTING judge grades the multi-step answer unchanged.
+        verdict: EvalResult = state.judge.evaluate(result.eval_answer)
+    except LLMError as e:
+        raise HTTPException(status_code=502, detail=f"LLM backend error: {e}") from e
+
+    return ChatResponse(
+        question=req.question,
+        answer=result.answer,
+        sources=result.sources,
+        trajectory=[t.to_dict() for t in result.trajectory],  # type: ignore[arg-type]
+        routing=_agent_routing_summary(result),
+        eval=verdict.to_dict(),  # type: ignore[arg-type]  (validated by EvalModel)
+        guardrail=result.guardrail.to_dict(),  # type: ignore[arg-type]  (validated by GuardrailModel)
     )
