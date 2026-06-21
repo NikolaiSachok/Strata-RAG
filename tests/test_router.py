@@ -268,6 +268,33 @@ def test_dispatch_aggregation_runs_templated_query(fixture_sidecar, monkeypatch)
     assert pipe.semantic_calls == 0  # the sidecar answered; semantic was NOT touched
 
 
+def test_dispatch_aggregation_answer_is_deterministic_renderer_output(fixture_sidecar, monkeypatch):
+    """LOAD-BEARING INVARIANT (issue #16): an aggregation answer's TEXT must be the verbatim
+    output of the deterministic renderer (aggregate.format_aggregation_answer), never LLM-composed
+    — that's exactly what lets the eval Judge SKIP passage-faithfulness for this route safely. Pin
+    the coupling: re-derive the renderer output from the SAME executed query and require equality."""
+    _monkeypatch_sidecar(monkeypatch, fixture_sidecar)
+    fake = FakeRouterLLM({"route": "aggregation", "confidence": 0.95, "reasoning": "group",
+                          "intent": "group_by_count", "field": "publisher", "filter": None})
+    ans = dispatch("how many projects per publisher?", StubPipeline(llm=fake), use_rules=False)
+    assert ans.routing["executed_route"] == "aggregation"
+    # Re-run the SAME templated query and render it; the dispatched text must match verbatim.
+    result = aggregate.execute("group_by_count", field="publisher")
+    assert ans.answer == aggregate.format_aggregation_answer(result)
+
+
+def test_dispatch_lookup_answer_is_deterministic_renderer_output(fixture_sidecar, monkeypatch):
+    """Same renderer-equality invariant for the lookup route (the other DETERMINISTIC route)."""
+    _monkeypatch_sidecar(monkeypatch, fixture_sidecar)
+    fake = FakeRouterLLM({"route": "lookup", "confidence": 0.95, "reasoning": "lookup",
+                          "intent": "lookup", "field": None,
+                          "filter": {"key": "northwind/1"}})
+    ans = dispatch("show me project northwind/1", StubPipeline(llm=fake), use_rules=False)
+    assert ans.routing["executed_route"] == "lookup"
+    result = aggregate.execute("lookup", filter={"key": "northwind/1"})
+    assert ans.answer == aggregate.format_aggregation_answer(result)
+
+
 def test_dispatch_semantic_path_attaches_routing(fixture_sidecar, monkeypatch):
     _monkeypatch_sidecar(monkeypatch, fixture_sidecar)
     fake = FakeRouterLLM({"route": "semantic", "confidence": 0.7, "reasoning": "theme"})

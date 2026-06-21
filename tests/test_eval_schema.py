@@ -224,3 +224,39 @@ def test_judge_instruction_echo_stripped_from_findings():
     result = parse_eval(raw)
     assert "real finding" in result.findings
     assert all("Return the JSON verdict" not in f for f in result.findings)
+
+
+def test_findings_filter_is_coupled_to_the_prompt_trailer_constant():
+    """The echo filter MUST be derived from the SAME constant that builds the judge prompt's
+    trailer (JUDGE_PROMPT_TRAILER) — a single source of truth. This pins the coupling so that
+    editing the trailer can't silently stale the filter:
+      1. the shared trailer constant IS in the filter's echo set, AND
+      2. feeding the EXACT trailer text the prompt ends with through the filter drops it.
+    If someone edits JUDGE_PROMPT_TRAILER, (2) still holds (the filter is built from it); if
+    someone instead hardcodes a DIFFERENT echo string decoupled from the constant, (1) fails."""
+    from rageval.eval import JUDGE_PROMPT_TRAILER, _clean_findings, _JUDGE_INSTRUCTION_ECHOES
+
+    # (1) The trailer constant is the source of the echo set.
+    assert JUDGE_PROMPT_TRAILER in _JUDGE_INSTRUCTION_ECHOES
+    # (2) The exact trailer the prompt appends is filtered out.
+    dropped = _clean_findings([JUDGE_PROMPT_TRAILER, "a genuine finding"])
+    assert JUDGE_PROMPT_TRAILER not in dropped
+    assert "a genuine finding" in dropped
+
+
+def test_findings_filter_tolerates_cosmetic_echo_variants():
+    """Robust matching (not exact-equality): trailing-whitespace / punctuation / quote variants of
+    the trailer are still recognised as instruction echoes and dropped, while a legitimate finding
+    that merely MENTIONS the instruction in passing is preserved (no over-stripping)."""
+    from rageval.eval import JUDGE_PROMPT_TRAILER, _clean_findings
+
+    variants = [
+        JUDGE_PROMPT_TRAILER,
+        JUDGE_PROMPT_TRAILER + "   ",          # trailing whitespace
+        JUDGE_PROMPT_TRAILER.rstrip("."),      # missing trailing period
+        '"' + JUDGE_PROMPT_TRAILER + '"',      # quoted by the model
+        "return the json verdict now",         # lowercased, no period
+    ]
+    real = "The answer omits the publisher, so it does not return the JSON verdict the user wanted."
+    cleaned = _clean_findings(variants + [real])
+    assert cleaned == [real], cleaned

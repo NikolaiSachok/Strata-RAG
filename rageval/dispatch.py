@@ -85,6 +85,17 @@ def _try_aggregation(question: str, decision: RouteDecision) -> Answer | None:
     if result.intent != "count" and result.row_count == 0:
         return None
     answer_text = _format_aggregation_answer(result)
+    # LOAD-BEARING INVARIANT (issue #16): the answer text on an aggregation/lookup route MUST be
+    # the DETERMINISTIC render of the executed query's rows (aggregate.format_aggregation_answer),
+    # never LLM-composed prose. The eval Judge SKIPS passage-faithfulness for these routes
+    # (eval.DETERMINISTIC_ROUTES) precisely because faithfulness-to-the-sidecar is structural here
+    # — the renderer can only restate the rows. If a future change makes this text LLM-composed,
+    # that skip becomes a silent hallucination hole. Assert the coupling so such a change fails
+    # LOUDLY here instead of quietly downstream.
+    assert answer_text == _format_aggregation_answer(result), (
+        "aggregation/lookup answer text must be the deterministic renderer output; the "
+        "faithfulness-skip in eval.py depends on it (issue #16)."
+    )
     return Answer(
         question=question,
         answer=answer_text,

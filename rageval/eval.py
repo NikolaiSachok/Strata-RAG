@@ -99,13 +99,20 @@ JUDGE_RELEVANCE_ONLY_SYSTEM_PROMPT = (
     "to one sentence."
 )
 
-# The judge prompt's own trailing instruction. A judge model sometimes echoes this verbatim into a
-# `findings` entry (observed live on an aggregation answer with empty CONTEXT). It is the JUDGE's
-# instruction to ITSELF, never a property of the evaluated answer, so we strip it from findings so
-# it can't surface as a spurious "problem" in the verdict.
+# The judge prompt's own trailing instruction — the SINGLE SOURCE OF TRUTH. Both judge prompts
+# (semantic + relevance-only) end with this exact line, and the findings sanitizer derives its
+# echo set from it. Editing the trailer here updates BOTH the prompt and the filter together, so
+# they can never drift out of sync (the bug this constant prevents). test_eval_schema asserts the
+# coupling.
+JUDGE_PROMPT_TRAILER = "Return the JSON verdict now."
+
+# Instruction echoes the judge sometimes copies VERBATIM into a `findings` entry (observed live on
+# an aggregation answer with empty CONTEXT, where it has little real content to critique). They are
+# the JUDGE's instructions to ITSELF, never a property of the evaluated answer, so we strip them so
+# they can't surface as a spurious "problem". DERIVED from the shared trailer above (+ the other
+# fixed instruction phrasing both system prompts use) so they stay coupled to the actual prompt.
 _JUDGE_INSTRUCTION_ECHOES = (
-    "return the json verdict now.",
-    "return the json verdict now",
+    JUDGE_PROMPT_TRAILER,
     "return only a json object",
 )
 
@@ -212,21 +219,38 @@ def _clean_findings(raw_findings) -> list[str]:
     """Normalise the judge's `findings` into a list[str], dropping any entry that is just the
     judge prompt's OWN trailing instruction echoed back (issue #16).
 
-    A judge model occasionally copies its instruction ("Return the JSON verdict now.") into a
-    finding — most visibly on an aggregation answer with empty CONTEXT, where it has little real
-    content to critique. That text describes the JUDGE's task, not a defect in the evaluated
-    answer, so surfacing it as a finding is misleading. We filter those echoes out."""
+    A judge model occasionally copies its instruction (the shared JUDGE_PROMPT_TRAILER,
+    "Return the JSON verdict now.") into a finding — most visibly on an aggregation answer with
+    empty CONTEXT, where it has little real content to critique. That text describes the JUDGE's
+    task, not a defect in the evaluated answer, so surfacing it as a finding is misleading. We
+    filter those echoes out.
+
+    Matching is DELIBERATELY robust, not exact-equality: we normalise (lowercase, strip
+    surrounding whitespace/quotes, drop trailing punctuation) and drop a finding whose normalised
+    text STARTS WITH a normalised instruction echo. That tolerates trailing-whitespace/punctuation
+    variants and a model that prefixes the echo with a quote — while a `startswith` (anchored at
+    the front, not a loose substring) avoids over-stripping a legitimate finding that merely
+    mentions the instruction in passing."""
     if not isinstance(raw_findings, list):
         raw_findings = [raw_findings] if raw_findings else []
+    echoes = tuple(_normalize_echo(e) for e in _JUDGE_INSTRUCTION_ECHOES)
     cleaned: list[str] = []
     for f in raw_findings:
         s = str(f).strip()
         if not s:
             continue
-        if s.lower().rstrip(".") in (e.rstrip(".") for e in _JUDGE_INSTRUCTION_ECHOES):
+        norm = _normalize_echo(s)
+        if any(norm.startswith(e) for e in echoes if e):
             continue
         cleaned.append(s)
     return cleaned
+
+
+def _normalize_echo(text: str) -> str:
+    """Normalise a finding / instruction echo for robust comparison: lowercase, strip surrounding
+    whitespace and quotes, and drop trailing punctuation/whitespace. Keeps the filter coupled to
+    JUDGE_PROMPT_TRAILER while tolerating cosmetic variants the model introduces."""
+    return str(text).strip().strip("'\"").lower().rstrip(" .!?:;").strip()
 
 
 def parse_eval(raw: str, threshold: str = DEFAULT_GATE_SEVERITY, *,
@@ -313,7 +337,7 @@ class Judge:
             f"QUESTION:\n{answer.question}\n\n"
             f"CONTEXT:\n{answer.context_text()}\n\n"
             f"ANSWER:\n{answer.answer}\n\n"
-            "Return the JSON verdict now."
+            f"{JUDGE_PROMPT_TRAILER}"
         )
         raw = self.llm.complete(JUDGE_SYSTEM_PROMPT, prompt, max_tokens=600)
         return parse_eval(raw, threshold)
@@ -326,7 +350,7 @@ class Judge:
         prompt = (
             f"QUESTION:\n{answer.question}\n\n"
             f"ANSWER:\n{answer.answer}\n\n"
-            "Return the JSON verdict now."
+            f"{JUDGE_PROMPT_TRAILER}"
         )
         raw = self.llm.complete(JUDGE_RELEVANCE_ONLY_SYSTEM_PROMPT, prompt, max_tokens=400)
         result = parse_eval(raw, threshold, faithfulness_applicable=False)
