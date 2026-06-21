@@ -24,6 +24,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 from .config import Settings
+from .dispatch import dispatch
 from .eval import EvalResult, Judge
 from .generate import RagPipeline
 from .llm import LLMError, backend_status
@@ -72,14 +73,34 @@ class GuardrailModel(BaseModel):
     layers: dict[str, bool]
 
 
+class RoutingModel(BaseModel):
+    """The query-router's transparent decision (see router.py / dispatch.py). Surfaced so a
+    client can SEE which engine answered (semantic vs the sidecar), how confident the router
+    was, and — for an aggregation — the EXACT templated query + bound params that ran.
+
+    Extra keys (executed_query, params, intent, row_count, fell_back, hybrid_source_set, note)
+    appear only on the paths that produce them, so the model allows them rather than 5 optional
+    fields the semantic path would always leave null."""
+    model_config = {"extra": "allow"}
+
+    route: str
+    confidence: float
+    reasoning: str
+    method: str
+    executed_route: str
+    fell_back: bool = False
+
+
 class AskResponse(BaseModel):
     """What POST /ask returns: the grounded answer, its cited sources, the judge's verdict,
-    and the guardrail report — RAG with both a quality gate AND an injection-defense audit."""
+    the guardrail report, AND the routing decision — RAG with a quality gate, an injection-defense
+    audit, AND a transparent record of which engine served the question."""
     question: str
     answer: str
     sources: list[str]
     eval: EvalModel
     guardrail: GuardrailModel
+    routing: RoutingModel | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -168,7 +189,10 @@ def ask(req: AskRequest) -> AskResponse:
             raise HTTPException(status_code=503, detail=str(e)) from e
 
     try:
-        answer = state.pipeline.answer(req.question)
+        # ROUTE → run the chosen engine (semantic / aggregation / lookup / hybrid). The router
+        # reuses the pipeline's own LLM backend for classification; the answer carries a
+        # transparent `routing` block. Semantic-routed questions behave exactly as before.
+        answer = dispatch(req.question, state.pipeline)
         verdict: EvalResult = state.judge.evaluate(answer)
     except LLMError as e:
         raise HTTPException(status_code=502, detail=f"LLM backend error: {e}") from e
@@ -180,4 +204,5 @@ def ask(req: AskRequest) -> AskResponse:
         sources=answer.sources,
         eval=verdict.to_dict(),  # type: ignore[arg-type]  (validated by EvalModel)
         guardrail=answer.guardrail.to_dict(),  # type: ignore[arg-type]  (validated by GuardrailModel)
+        routing=answer.routing,  # type: ignore[arg-type]  (validated by RoutingModel; None ok)
     )

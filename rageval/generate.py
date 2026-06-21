@@ -99,6 +99,10 @@ class Answer:
     sources: list[str]            # distinct "source_set/project_id (file)" labels used as context
     chunks: list[Retrieved]       # the actual retrieved chunks (for eval + debugging)
     guardrail: g.GuardrailReport = field(default_factory=g.GuardrailReport)
+    # TRANSPARENCY: when the question went through the query router (dispatch.py), this holds the
+    # routing decision + (for aggregation) the exact templated query/params that ran. None when
+    # the pipeline was called directly (semantic-only path), so existing callers are unaffected.
+    routing: dict | None = None
 
     def context_text(self) -> str:
         """Re-render the context exactly as the model saw it (for the eval judge)."""
