@@ -59,6 +59,7 @@ from dataclasses import dataclass
 from . import aggregate
 from . import guardrails as g
 from .generate import Answer, RagPipeline
+from .redact import redact
 
 # A hard cap on tool calls per user turn. The loop is LLM-driven, so without a ceiling a
 # confused model could ping-pong forever (or burn budget). When the cap is hit we stop
@@ -70,13 +71,20 @@ MAX_TOOL_CALLS = 5
 # context. Metadata/aggregation results are NOT bounded by this — see below (#27).
 _OBSERVATION_CHARS = 1500
 
-# Metadata/aggregation observations (#27) are NOT truncated by _OBSERVATION_CHARS. A
-# `group_by_count` with many groups must reach the agent IN FULL — otherwise the agent only sees
-# the head of the list and UNDER-COUNTS, and the eval grounds faithfulness against a truncated
-# result (a correct "16 groups" answer fails because the observation was cut to 2). These results
-# are already hard-bounded upstream (aggregate.MAX_LIMIT rows, each a short rendered line), so the
-# prompt stays bounded WITHOUT a character cut. None = "no truncation"; metadata uses this.
-_METADATA_OBSERVATION_CHARS: int | None = None
+# Metadata/aggregation observations (#27) are NOT subject to the small SEMANTIC _OBSERVATION_CHARS
+# cap. A `group_by_count` with many groups must reach the agent IN FULL — otherwise the agent only
+# sees the head of the list and UNDER-COUNTS (#27's bug), and the eval grounds faithfulness against
+# a truncated result. They get their OWN much larger bound instead of none at all.
+#
+# COST CAP (correctness). A single templated query is row-bounded upstream (aggregate.MAX_LIMIT =
+# 1000 rows, each a short rendered line), so ONE observation is finite. But the loop can issue up
+# to MAX_TOOL_CALLS of them, and each re-enters the loop prompt, the compose prompt, AND the judge
+# prompt — so an unbounded per-observation size would COMPOUND across calls + stages. We therefore
+# keep a GENEROUS but FINITE per-observation bound: high enough that a normal group-by (a few dozen
+# short lines — well under 1 KB) is NEVER touched (so #27's under-count bug stays fixed), yet it
+# caps a pathological maximal-LIMIT (≈1000-row) group-by so MAX_TOOL_CALLS of them can't blow the
+# context. At ~12 chars/line a full 1000-row group-by is ≈12 KB; this bound trims only that tail.
+_METADATA_OBSERVATION_CHARS: int | None = 12000
 
 
 def _truncate_observation(obs: str, tool: str) -> str:
@@ -561,11 +569,14 @@ class ChatAgent:
             scratch.append(f"[{tool} args={json.dumps(args, default=str)}] → {framed}")
             # #26: record SUCCESSFUL metadata/aggregation observations as non-passage EVIDENCE for
             # the eval. The agent's answer may state counts/aggregates that came from this tool
-            # result (not from a retrieved chunk); threading the FULL observation (un-truncated,
-            # #27) into the eval context lets the judge ground those claims — a faithful render
-            # passes, a mis-rendered count fails. Semantic results are evidence via all_chunks.
+            # result (not from a retrieved chunk); threading the observation into the eval context
+            # lets the judge ground those claims — a faithful render passes, a mis-rendered count
+            # fails. Semantic results are evidence via all_chunks. We thread the SAME bounded form
+            # the agent saw (_truncate_observation): a normal group-by (well under the generous
+            # metadata cap) is byte-identical (#27 under-count stays fixed), while a pathological
+            # maximal-LIMIT result is capped so it can't compound across the judge prompt too.
             if ok and tool == TOOL_METADATA:
-                tool_observations.append(obs)
+                tool_observations.append(_truncate_observation(obs, tool))
 
         # If we never got an explicit final (cap hit, or a garbled/unparsed step), force a
         # composition step from the scratchpad so the user always gets a grounded answer.
@@ -658,7 +669,16 @@ class ChatAgent:
                 if isinstance(v, str):
                     _scan_tool_input(v, where="tool_input:query_metadata.filter", report=report)
         obs, _result, err = _run_metadata_tool(args)
+        # PII (MEDIUM-1). The chunk path is PII-redacted at INGEST, but the sidecar holds raw
+        # structured fields: `contact_emails` is an ALLOWED_FIELD rendered VERBATIM by lookup /
+        # SELECT *, so a personal email would otherwise reach the LLM (re-fed agent prompt AND the
+        # eval judge) un-redacted. DECISION: redact the observation in place — reuse the existing
+        # ingest-time `redact` primitive (secret + policy-aware PII pass) so the SAME guardrail
+        # protects the metadata channel. We pass no doc_type → the default (non-public) policy
+        # redacts personal emails while role/published contacts pass through, identical to ingest.
+        obs, _n_sec, _n_pii = redact(obs)
         # #7: a lookup/SELECT * can surface a URL stored in corpus metadata — count it as grounded.
+        # (Done AFTER redaction so a redacted credential/email can't seed the allowed-URL set.)
         grounded_urls |= g._urls_in(obs)
         return obs, err is None
 

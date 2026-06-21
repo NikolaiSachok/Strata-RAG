@@ -685,9 +685,12 @@ def test_live_hybrid_count_grounds_against_tool_observation(fixture_sidecar):
     """THE LIVE BUG (#26): a HYBRID /chat answer that used semantic_search AND a query_metadata
     group-by, whose answer cites COUNTS that came from the metadata tool observation (NOT from a
     chunk). Before the fix faithfulness graded the answer against the CHUNKS ALONE — so the
-    tool-sourced counts looked hallucinated → faithfulness:critical on a CORRECT answer. Now the
-    tool observation is in the eval CONTEXT, so a real judge (full rubric) grounds the counts and
-    passes."""
+    tool-sourced counts looked hallucinated → faithfulness:critical on a CORRECT answer.
+
+    With a SCRIPTED judge we assert the WIRING the fix puts in place, not a live model's judgement:
+    the group-by counts reach the eval CONTEXT (so they're available to ground against), the FULL
+    faithfulness+relevance rubric runs (agent answers carry no routing block → not skipped), the
+    tool result reaches the judge PROMPT, and a 'faithful' verdict therefore passes the gate."""
     from rageval.eval import NOT_APPLICABLE, Judge
 
     llm = ScriptedLLM([
@@ -707,7 +710,8 @@ def test_live_hybrid_count_grounds_against_tool_observation(fixture_sidecar):
     assert "Maple: 2" in ctx and "Cedar: 2" in ctx
     assert result.eval_answer.routing is None   # agent path is always GRADED, never skipped
 
-    # A real judge that — seeing the counts in CONTEXT — marks the answer faithful → gate PASSES.
+    # A scripted judge returning a 'faithful' verdict → with the counts wired into CONTEXT, the
+    # gate PASSES. (We assert the wiring + gate, not that a live judge discriminates.)
     good = ('{"faithfulness": {"score": 5, "severity": "none", "reason": "Counts match the tool result."},'
             ' "answer_relevance": {"score": 5, "severity": "none", "reason": "On topic."},'
             ' "findings": []}')
@@ -722,10 +726,12 @@ def test_live_hybrid_count_grounds_against_tool_observation(fixture_sidecar):
 
 
 def test_mis_rendered_count_fails_against_tool_observation(fixture_sidecar):
-    """THE NEW REAL CHECK (#26): an agent answer whose stated count CONTRADICTS the tool
-    observation (says "16" while the group-by result said "2") fails faithfulness — because the
-    tool result is now in the CONTEXT to check against. This is the blind-spot the #23 skip left
-    open; grounding closes it."""
+    """THE NEW CHECK (#26): an agent answer whose stated count CONTRADICTS the tool observation
+    (says "16" while the group-by result said "2"). What we ASSERT here (with a scripted judge) is
+    the WIRING that makes the contradiction catchable: the true counts reach the eval CONTEXT, the
+    answer is GRADED (routing is None → not skipped), and a faithfulness-fail verdict propagates to
+    the gate. This is the blind-spot the #23 skip left open; grounding the tool result into the
+    judge CONTEXT is what closes it (a live judge then has the evidence to discriminate)."""
     from rageval.eval import Judge
 
     llm = ScriptedLLM([
@@ -740,7 +746,8 @@ def test_mis_rendered_count_fails_against_tool_observation(fixture_sidecar):
     assert "Maple: 2" in ctx and "Cedar: 2" in ctx
     assert result.eval_answer.routing is None
 
-    # A real judge comparing the answer's "16/9" to the tool result "2/2" flags the contradiction.
+    # A scripted judge returning a faithfulness-fail verdict propagates to the gate; the tool
+    # result "2/2" is in CONTEXT so a live judge would have the evidence to flag the "16/9" answer.
     bad = ('{"faithfulness": {"score": 1, "severity": "critical",'
            ' "reason": "Answer says 16/9 but the tool result is 2/2."},'
            ' "answer_relevance": {"score": 5, "severity": "none", "reason": "On topic."},'
@@ -947,3 +954,129 @@ def test_observations_are_spotlighted_in_prompt(fixture_sidecar):
     sentinel = result.guardrail.sentinel
     assert sentinel
     assert sentinel in llm.calls[-1]
+
+
+# ===========================================================================
+# PII (MEDIUM-1): contact_emails is an ALLOWED_FIELD rendered VERBATIM by a
+# lookup / SELECT *. A personal email in the sidecar must NOT reach the re-fed
+# agent prompt NOR the eval judge context un-redacted — the metadata observation
+# is run through the ingest-time `redact` primitive before it is used.
+# ===========================================================================
+
+def _email_sidecar(tmp_path, monkeypatch, emails):
+    """A one-row sidecar whose contact_emails holds `emails`, so a lookup renders them verbatim."""
+    db = tmp_path / "side.sqlite"
+    conn = connect(db)
+    upsert_project(conn, ProjectRecord(
+        project_id="5", source_set="northwind", publisher="Maple",
+        app_name="Echo", contact_emails=list(emails), chunk_count=1))
+    conn.close()
+    monkeypatch.setattr(aggregate, "SIDECAR_PATH", db)
+    return db
+
+
+def test_personal_email_not_in_judge_context_or_agent_prompt(tmp_path, monkeypatch):
+    """MEDIUM-1: a PERSONAL contact_emails value is redacted out of the metadata observation, so it
+    reaches NEITHER the eval judge CONTEXT (context_text / tool_observations) NOR the re-fed agent
+    prompt verbatim — only the [REDACTED_EMAIL] placeholder does."""
+    personal = "jane.doe.personal@example.com"
+    _email_sidecar(tmp_path, monkeypatch, [personal])
+    llm = ScriptedLLM([
+        _tool("query_metadata", {"intent": "lookup", "filter": {"project_id": "5"}}),
+        _final("Looked up project 5."),
+    ])
+    agent = ChatAgent(StubPipeline(llm=llm), llm=llm)
+    result = agent.chat("look up project 5's contact")
+
+    # The raw personal email is nowhere in the eval evidence the judge would grade.
+    ctx = result.eval_answer.context_text()
+    assert personal not in ctx
+    assert all(personal not in o for o in result.eval_answer.tool_observations)
+    # Nor in any prompt re-fed to the agent (the scratchpad observation was redacted in place).
+    assert all(personal not in p for p in llm.calls)
+    # The redaction placeholder is what survives (the field is still represented, just scrubbed).
+    assert "[REDACTED_EMAIL]" in ctx
+
+
+def test_published_role_email_is_preserved(tmp_path, monkeypatch):
+    """The PII pass is policy-aware (not blanket): a ROLE-based / published business contact
+    (support@) is KEPT in the metadata observation — only personal data is scrubbed."""
+    role = "support@corp.example"
+    _email_sidecar(tmp_path, monkeypatch, [role])
+    llm = ScriptedLLM([
+        _tool("query_metadata", {"intent": "lookup", "filter": {"project_id": "5"}}),
+        _final("Looked up project 5."),
+    ])
+    agent = ChatAgent(StubPipeline(llm=llm), llm=llm)
+    result = agent.chat("look up project 5's contact")
+    assert any(role in o for o in result.eval_answer.tool_observations)
+
+
+# ===========================================================================
+# COST CAP (correctness): a 5×large-group-by turn is bounded. Each metadata
+# observation is held to a generous-but-finite cap so MAX_TOOL_CALLS of maximal
+# results can't compound unboundedly across the loop / compose / judge prompts —
+# WITHOUT reintroducing the #27 under-count (a normal group-by is untouched).
+# ===========================================================================
+
+def test_metadata_cost_cap_is_a_finite_generous_bound():
+    """The cost cap is a GENEROUS but FINITE per-observation bound (not None). `_truncate_observation`
+    must enforce it on a metadata result that exceeds it — so even a maximal (MAX_LIMIT-row) group-by
+    can't push an unbounded observation into the loop / compose / judge prompts — while leaving a
+    normal-sized result byte-for-byte intact (#27 under-count stays fixed)."""
+    import rageval.agent as agent_mod
+    from rageval.agent import TOOL_METADATA, _truncate_observation
+
+    cap = agent_mod._METADATA_OBSERVATION_CHARS
+    assert isinstance(cap, int) and cap >= 8000, "expected a generous (≥8K) finite metadata cap"
+
+    # A maximal-size metadata render (above the cap) is truncated to exactly the cap.
+    oversized = "x" * (cap + 5000)
+    assert len(_truncate_observation(oversized, TOOL_METADATA)) == cap
+    # A normal-sized group-by (well under the cap) is returned untouched — no #27 under-count.
+    normal = "Grouped counts — Maple: 2; Cedar: 2."
+    assert _truncate_observation(normal, TOOL_METADATA) == normal
+
+
+def test_aggregate_cost_cap_bounds_five_distinct_group_bys(tmp_path, monkeypatch):
+    """A turn that issues MAX_TOOL_CALLS DISTINCT group-bys accumulates finite evidence: each
+    threaded metadata observation is bounded by the cap, so the TOTAL eval context (what the judge
+    prompt interpolates) is bounded by cap × MAX_TOOL_CALLS, never compounding without limit."""
+    import rageval.agent as agent_mod
+
+    cap = agent_mod._METADATA_OBSERVATION_CHARS
+    db = tmp_path / "side.sqlite"
+    conn = connect(db)
+    for i in range(20):
+        upsert_project(conn, ProjectRecord(
+            project_id=str(i), source_set="northwind", publisher=f"Pub{i % 4}",
+            app_category=f"cat{i % 3}", app_name=f"App{i:02d}", chunk_count=i % 5))
+    conn.close()
+    monkeypatch.setattr(aggregate, "SIDECAR_PATH", db)
+
+    # Five DISTINCT group-by fields → five distinct (uncached) tool observations, then compose.
+    fields = ["publisher", "app_category", "app_name", "chunk_count", "source_set"]
+    llm = ScriptedLLM([_tool("query_metadata",
+                             {"intent": "group_by_count", "field": f, "filter": None})
+                       for f in fields])
+    agent = ChatAgent(StubPipeline(llm=llm), llm=llm, max_tool_calls=5)
+    result = agent.chat("slice it five ways")
+
+    assert len(result.eval_answer.tool_observations) == 5      # five distinct observations threaded
+    assert all(len(o) <= cap for o in result.eval_answer.tool_observations)
+    # The full eval CONTEXT is bounded by the per-obs cap × the call cap (+ block scaffolding).
+    assert len(result.eval_answer.context_text()) <= cap * 5 + 2000
+
+
+def test_normal_group_by_is_not_truncated_by_cost_cap(fixture_sidecar):
+    """The cap must NOT reintroduce the #27 under-count: a NORMAL group-by (a handful of short
+    lines, far under the cap) reaches the agent and eval byte-for-byte, every group present."""
+    llm = ScriptedLLM([
+        _tool("query_metadata", {"intent": "group_by_count", "field": "publisher", "filter": None}),
+        _final("Maple: 2; Cedar: 2."),
+    ])
+    agent = ChatAgent(StubPipeline(llm=llm), llm=llm)
+    result = agent.chat("projects per publisher?")
+    obs = "\n".join(result.eval_answer.tool_observations)
+    # Both groups survive in full — nothing truncated.
+    assert "Maple: 2" in obs and "Cedar: 2" in obs
