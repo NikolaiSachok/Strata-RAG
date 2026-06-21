@@ -123,6 +123,35 @@ def test_semantic_only_turn(fixture_sidecar):
     assert result.sources == ["northwind/1 (overview.md)"]
 
 
+def test_agent_answer_gets_full_faithfulness_grading(fixture_sidecar):
+    """An AGENT answer is LLM-COMPOSED, so it carries NO routing block → executed_route defaults to
+    'semantic' → the route-aware Judge runs the FULL faithfulness+relevance rubric on it. This is
+    the property that keeps LLM-composed agent answers honest: unlike a deterministic aggregation
+    render, an agent's prose CAN hallucinate, so it must NOT inherit the faithfulness-skip."""
+    from rageval.eval import NOT_APPLICABLE, Judge
+
+    llm = ScriptedLLM([
+        _tool("semantic_search", {"query": "which projects feel playful?"}),
+        _final("Alpha feels playful [1]."),
+    ])
+    agent = ChatAgent(StubPipeline(llm=llm), llm=llm)
+    result = agent.chat("which projects feel playful?")
+    # The eval_answer the Judge grades has no routing block.
+    assert getattr(result.eval_answer, "routing", None) in (None, {})
+
+    # A scripted judge that would FAIL on faithfulness; because the agent answer is graded
+    # semantically, that faithfulness verdict is REAL (not skipped) and the gate fails.
+    judge_llm = ScriptedLLM(
+        [{"faithfulness": {"score": 1, "severity": "critical", "reason": "Hallucinated."},
+          "answer_relevance": {"score": 5, "severity": "none", "reason": "On topic."},
+          "findings": []}])
+    verdict = Judge(llm=judge_llm).evaluate(result.eval_answer)
+    # faithfulness is GRADED (a real severity), not the route-aware skip sentinel → full rubric ran.
+    assert verdict.faithfulness.severity == "critical"
+    assert verdict.faithfulness.severity != NOT_APPLICABLE
+    assert verdict.overall_pass is False
+
+
 def test_aggregation_only_turn(fixture_sidecar):
     llm = ScriptedLLM([
         _tool("query_metadata", {"intent": "count", "field": None, "filter": None}),

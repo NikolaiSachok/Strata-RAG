@@ -268,6 +268,33 @@ def test_dispatch_aggregation_runs_templated_query(fixture_sidecar, monkeypatch)
     assert pipe.semantic_calls == 0  # the sidecar answered; semantic was NOT touched
 
 
+def test_dispatch_aggregation_answer_is_deterministic_renderer_output(fixture_sidecar, monkeypatch):
+    """LOAD-BEARING INVARIANT (issue #16): an aggregation answer's TEXT must be the verbatim
+    output of the deterministic renderer (aggregate.format_aggregation_answer), never LLM-composed
+    — that's exactly what lets the eval Judge SKIP passage-faithfulness for this route safely. Pin
+    the coupling: re-derive the renderer output from the SAME executed query and require equality."""
+    _monkeypatch_sidecar(monkeypatch, fixture_sidecar)
+    fake = FakeRouterLLM({"route": "aggregation", "confidence": 0.95, "reasoning": "group",
+                          "intent": "group_by_count", "field": "publisher", "filter": None})
+    ans = dispatch("how many projects per publisher?", StubPipeline(llm=fake), use_rules=False)
+    assert ans.routing["executed_route"] == "aggregation"
+    # Re-run the SAME templated query and render it; the dispatched text must match verbatim.
+    result = aggregate.execute("group_by_count", field="publisher")
+    assert ans.answer == aggregate.format_aggregation_answer(result)
+
+
+def test_dispatch_lookup_answer_is_deterministic_renderer_output(fixture_sidecar, monkeypatch):
+    """Same renderer-equality invariant for the lookup route (the other DETERMINISTIC route)."""
+    _monkeypatch_sidecar(monkeypatch, fixture_sidecar)
+    fake = FakeRouterLLM({"route": "lookup", "confidence": 0.95, "reasoning": "lookup",
+                          "intent": "lookup", "field": None,
+                          "filter": {"key": "northwind/1"}})
+    ans = dispatch("show me project northwind/1", StubPipeline(llm=fake), use_rules=False)
+    assert ans.routing["executed_route"] == "lookup"
+    result = aggregate.execute("lookup", filter={"key": "northwind/1"})
+    assert ans.answer == aggregate.format_aggregation_answer(result)
+
+
 def test_dispatch_semantic_path_attaches_routing(fixture_sidecar, monkeypatch):
     _monkeypatch_sidecar(monkeypatch, fixture_sidecar)
     fake = FakeRouterLLM({"route": "semantic", "confidence": 0.7, "reasoning": "theme"})
@@ -333,3 +360,30 @@ def test_routing_block_shape_is_json_serializable(fixture_sidecar, monkeypatch):
     blob = json.dumps(ans.routing)
     back = json.loads(blob)
     assert set(["route", "confidence", "reasoning", "method", "executed_route", "fell_back"]) <= set(back)
+
+
+# ===========================================================================
+# 5. Route-aware eval end-to-end (issue #16): a DISPATCHED aggregation answer,
+#    graded by the REAL Judge, must PASS — not fail on a bogus faithfulness flag.
+# ===========================================================================
+
+def test_dispatched_aggregation_answer_passes_judge(fixture_sidecar, monkeypatch):
+    """The bug: the judge scored a sidecar aggregation answer faithfulness:critical (empty
+    CONTEXT) and FAILED it. End-to-end: dispatch an aggregation, then run the route-aware Judge
+    with a scripted relevance verdict — faithfulness is skipped and the answer passes."""
+    from rageval.eval import NOT_APPLICABLE, Judge
+
+    _monkeypatch_sidecar(monkeypatch, fixture_sidecar)
+    router_llm = FakeRouterLLM({"route": "aggregation", "confidence": 0.95, "reasoning": "count",
+                                "intent": "group_by_count", "field": "publisher", "filter": None})
+    pipe = StubPipeline(llm=router_llm)
+    ans = dispatch("how many projects per publisher?", pipe, use_rules=False)
+    assert ans.routing["executed_route"] == "aggregation"
+    assert ans.sources == []  # the sidecar answered — empty sources is CORRECT here
+
+    judge_llm = FakeRouterLLM(
+        {"answer_relevance": {"score": 5, "severity": "none", "reason": "Answers it."},
+         "findings": []})
+    verdict = Judge(llm=judge_llm).evaluate(ans)
+    assert verdict.faithfulness.severity == NOT_APPLICABLE
+    assert verdict.overall_pass is True

@@ -41,6 +41,18 @@ from .llm import LLMBackend, get_llm
 SEVERITY_ORDER = ["none", "minor", "major", "critical"]
 DEFAULT_GATE_SEVERITY = "major"  # response fails if any dimension is this severe or worse
 
+# A dimension that DOESN'T APPLY to this answer's route (issue #16). It is deliberately NOT in
+# SEVERITY_ORDER: the gate skips a dimension carrying this severity entirely, so it can never
+# push overall_pass to fail. Passage-faithfulness is `not_applicable` for the deterministic
+# aggregation/lookup routes — those answers come from the SQL sidecar, not retrieved passages,
+# so an empty CONTEXT is CORRECT and must not be scored as a hallucination.
+NOT_APPLICABLE = "not_applicable"
+
+# Routes whose answers are produced DETERMINISTICALLY from the metadata sidecar (templated SQL),
+# NOT from retrieved passages. For these, passage-faithfulness against an (empty) CONTEXT is the
+# wrong test — we run a deterministic result-consistency check instead. Mirrors router.VALID_ROUTES.
+DETERMINISTIC_ROUTES = ("aggregation", "lookup")
+
 # The judge's instructions. We demand strict JSON so the result is machine-checkable.
 # Note we ask the judge to reason in the "reason" fields but still emit only JSON —
 # a small, robust contract that's easy to parse and test.
@@ -64,6 +76,46 @@ JUDGE_SYSTEM_PROMPT = (
     "critical (1). Keep reasons to one sentence."
 )
 
+# A RELEVANCE-ONLY judge prompt (issue #16): for the deterministic aggregation/lookup routes the
+# answer comes from the SQL sidecar, not retrieved passages, so passage-faithfulness doesn't apply
+# and there is no CONTEXT to ground against. We still want the ONE meaningful LLM-graded dimension —
+# does the answer address the question? — so we ask the judge for `answer_relevance` ALONE. (The
+# `faithfulness` dimension is filled in as `not_applicable` by us, never by the judge.)
+JUDGE_RELEVANCE_ONLY_SYSTEM_PROMPT = (
+    "You are a strict evaluation judge for a question-answering system whose answer was produced "
+    "by a DETERMINISTIC database query (not by reading passages). You will be given a QUESTION and "
+    "the ANSWER. Grade ONLY whether the answer addresses the question, and return ONLY a JSON "
+    "object (no prose, no code fences) with this exact shape:\n"
+    "{\n"
+    '  "answer_relevance": {"score": <1-5>, "severity": "none|minor|major|critical", "reason": "<short>"},\n'
+    '  "findings": ["<short notes about any problems>"]\n'
+    "}\n\n"
+    "Definition:\n"
+    "- answer_relevance: does the answer address the QUESTION that was actually asked? Do NOT "
+    "penalise the answer for lacking cited passages — it is a database result, not a passage "
+    "summary.\n"
+    "Scoring: 5 = perfect, 4 = minor issue, 3 = noticeable issue, 2 = serious issue, 1 = fails. "
+    "Set severity to reflect impact: none (5), minor (4), major (2-3), critical (1). Keep reasons "
+    "to one sentence."
+)
+
+# The judge prompt's own trailing instruction — the SINGLE SOURCE OF TRUTH. Both judge prompts
+# (semantic + relevance-only) end with this exact line, and the findings sanitizer derives its
+# echo set from it. Editing the trailer here updates BOTH the prompt and the filter together, so
+# they can never drift out of sync (the bug this constant prevents). test_eval_schema asserts the
+# coupling.
+JUDGE_PROMPT_TRAILER = "Return the JSON verdict now."
+
+# Instruction echoes the judge sometimes copies VERBATIM into a `findings` entry (observed live on
+# an aggregation answer with empty CONTEXT, where it has little real content to critique). They are
+# the JUDGE's instructions to ITSELF, never a property of the evaluated answer, so we strip them so
+# they can't surface as a spurious "problem". DERIVED from the shared trailer above (+ the other
+# fixed instruction phrasing both system prompts use) so they stay coupled to the actual prompt.
+_JUDGE_INSTRUCTION_ECHOES = (
+    JUDGE_PROMPT_TRAILER,
+    "return only a json object",
+)
+
 
 @dataclass
 class Dimension:
@@ -75,6 +127,11 @@ class Dimension:
     def normalized(self) -> "Dimension":
         """Clamp/repair model output so downstream code can rely on the schema even if
         the judge returns something slightly off (e.g. score 7, or an unknown severity)."""
+        # NOT_APPLICABLE is a route-aware sentinel (issue #16), not a graded severity — preserve it
+        # verbatim (it's set by us, never by the judge) so the gate can skip the dimension.
+        if self.severity == NOT_APPLICABLE:
+            return Dimension(score=int(self.score), severity=NOT_APPLICABLE,
+                             reason=str(self.reason)[:400])
         score = max(1, min(5, int(self.score)))
         severity = self.severity if self.severity in SEVERITY_ORDER else _severity_from_score(score)
         return Dimension(score=score, severity=severity, reason=str(self.reason)[:400])
@@ -105,7 +162,13 @@ def _severity_from_score(score: int) -> str:
 
 
 def _severity_at_least(severity: str, threshold: str) -> bool:
-    """True if `severity` is as bad as or worse than `threshold`."""
+    """True if `severity` is as bad as or worse than `threshold`.
+
+    A NOT_APPLICABLE dimension (issue #16) is never 'bad' — it doesn't apply to this route, so it
+    can't trip the gate. Returning False here is what lets a correct aggregation answer PASS even
+    though its (skipped) faithfulness dimension has no real severity."""
+    if severity == NOT_APPLICABLE:
+        return False
     return SEVERITY_ORDER.index(severity) >= SEVERITY_ORDER.index(threshold)
 
 
@@ -113,7 +176,8 @@ def compute_gate(faithfulness: Dimension, relevance: Dimension,
                  threshold: str = DEFAULT_GATE_SEVERITY) -> bool:
     """Pure gate logic, separated so it can be tested without any LLM call.
 
-    Returns True (pass) only if NEITHER dimension reaches the failing severity."""
+    Returns True (pass) only if NEITHER applicable dimension reaches the failing severity. A
+    dimension marked NOT_APPLICABLE (route-aware skip, issue #16) is excluded from the gate."""
     return not (
         _severity_at_least(faithfulness.severity, threshold)
         or _severity_at_least(relevance.severity, threshold)
@@ -151,41 +215,149 @@ def _dimension_from(raw: dict) -> Dimension:
     ).normalized()
 
 
-def parse_eval(raw: str, threshold: str = DEFAULT_GATE_SEVERITY) -> EvalResult:
+def _clean_findings(raw_findings) -> list[str]:
+    """Normalise the judge's `findings` into a list[str], dropping any entry that is just the
+    judge prompt's OWN trailing instruction echoed back (issue #16).
+
+    A judge model occasionally copies its instruction (the shared JUDGE_PROMPT_TRAILER,
+    "Return the JSON verdict now.") into a finding — most visibly on an aggregation answer with
+    empty CONTEXT, where it has little real content to critique. That text describes the JUDGE's
+    task, not a defect in the evaluated answer, so surfacing it as a finding is misleading. We
+    filter those echoes out.
+
+    Matching is DELIBERATELY robust, not exact-equality: we normalise (lowercase, strip
+    surrounding whitespace/quotes, drop trailing punctuation) and drop a finding whose normalised
+    text STARTS WITH a normalised instruction echo. That tolerates trailing-whitespace/punctuation
+    variants and a model that prefixes the echo with a quote — while a `startswith` (anchored at
+    the front, not a loose substring) avoids over-stripping a legitimate finding that merely
+    mentions the instruction in passing."""
+    if not isinstance(raw_findings, list):
+        raw_findings = [raw_findings] if raw_findings else []
+    echoes = tuple(_normalize_echo(e) for e in _JUDGE_INSTRUCTION_ECHOES)
+    cleaned: list[str] = []
+    for f in raw_findings:
+        s = str(f).strip()
+        if not s:
+            continue
+        norm = _normalize_echo(s)
+        if any(norm.startswith(e) for e in echoes if e):
+            continue
+        cleaned.append(s)
+    return cleaned
+
+
+def _normalize_echo(text: str) -> str:
+    """Normalise a finding / instruction echo for robust comparison: lowercase, strip surrounding
+    whitespace and quotes, and drop trailing punctuation/whitespace. Keeps the filter coupled to
+    JUDGE_PROMPT_TRAILER while tolerating cosmetic variants the model introduces."""
+    return str(text).strip().strip("'\"").lower().rstrip(" .!?:;").strip()
+
+
+def parse_eval(raw: str, threshold: str = DEFAULT_GATE_SEVERITY, *,
+               faithfulness_applicable: bool = True) -> EvalResult:
     """Turn the judge's raw text into a validated EvalResult. Separated from the LLM
-    call so the parsing/gating logic is unit-testable with canned strings."""
+    call so the parsing/gating logic is unit-testable with canned strings.
+
+    `faithfulness_applicable=False` (route-aware, issue #16) marks the passage-faithfulness
+    dimension `not_applicable` instead of grading it — used for the deterministic aggregation/
+    lookup routes, where the answer comes from the SQL sidecar (not passages) so there is no
+    CONTEXT to ground against. The dimension is then excluded from the gate."""
     data = _parse_judge_json(raw)
-    faithfulness = _dimension_from(data.get("faithfulness", {}))
+    if faithfulness_applicable:
+        faithfulness = _dimension_from(data.get("faithfulness", {}))
+    else:
+        faithfulness = Dimension(
+            score=5, severity=NOT_APPLICABLE,
+            reason="Deterministic route (sidecar query) — passage-faithfulness does not apply.",
+        )
     relevance = _dimension_from(data.get("answer_relevance", {}))
-    findings = data.get("findings") or []
-    if not isinstance(findings, list):
-        findings = [str(findings)]
     return EvalResult(
         faithfulness=faithfulness,
         answer_relevance=relevance,
         overall_pass=compute_gate(faithfulness, relevance, threshold),
-        findings=[str(f) for f in findings],
+        findings=_clean_findings(data.get("findings")),
     )
+
+
+def _executed_route(answer: Answer) -> str:
+    """The route that ACTUALLY produced this answer, from its routing block (dispatch.py).
+
+    We read `executed_route` (what ran) rather than the requested `route`, because an
+    aggregation that fell back to semantic carries executed_route='semantic' and MUST be graded
+    for faithfulness like any semantic answer. A direct (non-dispatched) pipeline answer has no
+    routing block → treat as 'semantic' (today's behaviour, no regression)."""
+    routing = getattr(answer, "routing", None)
+    if not isinstance(routing, dict):
+        return "semantic"
+    return str(routing.get("executed_route") or routing.get("route") or "semantic").lower()
+
+
+def _result_consistency_finding(answer: Answer) -> str | None:
+    """A cheap DETERMINISTIC consistency check for a sidecar (aggregation/lookup) answer.
+
+    The aggregation answer text is rendered DETERMINISTICALLY from the executed query's rows
+    (aggregate.format_aggregation_answer), so faithfulness-to-the-sidecar is structural, not an
+    LLM judgement. We don't re-grade it with the LLM; instead we surface one transparency note
+    when the routing block carries a row count, so the verdict still records that the answer
+    came from a real query result. Returns None if there's nothing to note."""
+    routing = getattr(answer, "routing", None)
+    if not isinstance(routing, dict):
+        return None
+    if "row_count" not in routing:
+        return None
+    intent = routing.get("intent", "query")
+    return (f"result-consistency: answer rendered from the executed {intent} query "
+            f"({routing.get('row_count')} row(s)); passage-faithfulness not applicable.")
 
 
 class Judge:
     """Wraps the LLM backend to evaluate answers. Reuses the same backend as the
     generator by default — in a stricter setup you might use a *different* (stronger)
-    model as judge, which this design allows by passing a separate llm."""
+    model as judge, which this design allows by passing a separate llm.
+
+    ROUTE-AWARE (issue #16): the judge looks at the answer's routing block to decide WHAT to
+    grade. Semantic (and the semantic hops of hybrid) get the full faithfulness + relevance
+    rubric, exactly as before. Aggregation/lookup answers come from the deterministic SQL
+    sidecar with an (correctly) empty CONTEXT, so scoring passage-faithfulness there produces a
+    bogus 'hallucinated/critical' verdict — instead we SKIP faithfulness (mark it
+    not_applicable), grade relevance ALONE, and add a deterministic result-consistency note."""
 
     def __init__(self, settings: Settings = SETTINGS, llm: LLMBackend | None = None):
         self.settings = settings
         self.llm = llm if llm is not None else get_llm(settings)
 
     def evaluate(self, answer: Answer, threshold: str = DEFAULT_GATE_SEVERITY) -> EvalResult:
+        if _executed_route(answer) in DETERMINISTIC_ROUTES:
+            return self._evaluate_deterministic(answer, threshold)
+        return self._evaluate_semantic(answer, threshold)
+
+    def _evaluate_semantic(self, answer: Answer, threshold: str) -> EvalResult:
+        """The original path: full faithfulness + relevance against the retrieved CONTEXT."""
         prompt = (
             f"QUESTION:\n{answer.question}\n\n"
             f"CONTEXT:\n{answer.context_text()}\n\n"
             f"ANSWER:\n{answer.answer}\n\n"
-            "Return the JSON verdict now."
+            f"{JUDGE_PROMPT_TRAILER}"
         )
         raw = self.llm.complete(JUDGE_SYSTEM_PROMPT, prompt, max_tokens=600)
         return parse_eval(raw, threshold)
+
+    def _evaluate_deterministic(self, answer: Answer, threshold: str) -> EvalResult:
+        """Route-aware path for aggregation/lookup (issue #16): NO passage-faithfulness against
+        the empty context (it would falsely flag 'hallucination'). We grade answer_relevance
+        only via the LLM, mark faithfulness not_applicable, and attach a deterministic
+        result-consistency note from the routing block."""
+        prompt = (
+            f"QUESTION:\n{answer.question}\n\n"
+            f"ANSWER:\n{answer.answer}\n\n"
+            f"{JUDGE_PROMPT_TRAILER}"
+        )
+        raw = self.llm.complete(JUDGE_RELEVANCE_ONLY_SYSTEM_PROMPT, prompt, max_tokens=400)
+        result = parse_eval(raw, threshold, faithfulness_applicable=False)
+        note = _result_consistency_finding(answer)
+        if note:
+            result.findings.append(note)
+        return result
 
 
 # ===========================================================================
