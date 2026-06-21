@@ -139,6 +139,24 @@ handled by an adapter (`sources/registry.py`). A new corpus shape = a new adapte
 one `register_adapter(...)` call; **nothing else in the engine changes.** The index and the
 metadata sidecar built from a custom corpus are **gitignored** — they're never committed.
 
+#### Overlay data dir (`RAGEVAL_DATA_DIR`)
+When you **pip-install the engine** and run it from a *consuming overlay*, your own data lives
+**with the overlay**, not inside the engine's package dir. Set `RAGEVAL_DATA_DIR` to point the
+engine at that folder — the metadata **sidecar** (`rageval.sqlite`), **`corpus-rules.yaml`**, the
+**golden eval set** (`eval/golden.yaml`), the **`manifests/`** dir, and the top-level **roster
+TSVs** all resolve under it:
+
+```bash
+RAGEVAL_DATA_DIR=/path/to/my-overlay-data python -m rageval.serve
+```
+
+Unset → everything resolves under the **engine package dir** (back-compat: the bundled sample
+runs with no env). This is the companion to `RAGEVAL_PLUGINS_DIR` (adapters) and
+`RAGEVAL_ROSTER_DIR` (rosters): one env var relocates all of the engine's mutable, corpus-specific
+data so the served engine reads the **same sidecar your overlay's ingest wrote** (without it, the
+engine looks in its own install dir and aggregation queries fail with *"unable to open database
+file"*). `RAGEVAL_ROSTER_DIR` still takes precedence for **just** the roster dir.
+
 > **Serve the same corpus you ingested.** The collection name is **corpus-scoped** (default =
 > sample → `…_sample`); to serve a custom-corpus index, set `RAGENGINE_CORPUS_ROOT` (or
 > `RAGEVAL_COLLECTION`) the **same way you did at ingest**. If they disagree — e.g. you ingested
