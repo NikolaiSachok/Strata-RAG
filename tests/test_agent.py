@@ -654,6 +654,155 @@ def test_aggregation_only_turn_reports_layers(fixture_sidecar):
     assert layers.get("spotlight") is True
 
 
+class _JudgeLLM:
+    """A fake LLM for the eval Judge: returns one canned judge reply and records the system prompt
+    it was called with, so a test can assert WHICH rubric (relevance-only vs full) ran."""
+    name = "judge-fake"
+
+    def __init__(self, reply: str):
+        self._reply = reply
+        self.last_system = ""
+
+    def complete(self, system: str, prompt: str, max_tokens: int = 600) -> str:
+        self.last_system = system
+        return self._reply
+
+
+# ===========================================================================
+# #16b: route-aware eval on the AGENT path. A pure-aggregation /chat answer
+# (only query_metadata → sources:[]) must NOT be false-failed on passage-
+# faithfulness; a semantic/hybrid /chat answer must still be graded against the
+# gathered chunks (and can still fail a genuinely unfaithful answer).
+# ===========================================================================
+
+def test_pure_aggregation_chat_answer_passes_route_aware_judge(fixture_sidecar):
+    """THE REGRESSED SCENARIO (#16b): a pure-aggregation /chat answer (agent used ONLY
+    query_metadata, so sources:[] and no chunks) graded through the REAL route-aware Judge →
+    overall_pass:true, faithfulness NOT critical (skipped / not_applicable). Before the fix the
+    eval_answer had no routing block → eval defaulted to 'semantic' → passage-faithfulness ran
+    against EMPTY context → faithfulness:1/critical → overall_pass:false on a correct answer."""
+    from rageval.eval import NOT_APPLICABLE, Judge
+
+    llm = ScriptedLLM([
+        _tool("query_metadata", {"intent": "group_by_count", "field": "publisher", "filter": None}),
+        _final("There are 2 projects each for Maple and Cedar."),
+    ])
+    agent = ChatAgent(StubPipeline(llm=llm), llm=llm)
+    result = agent.chat("how many projects per publisher?")
+
+    # Pure-aggregation turn: no semantic chunks gathered, the routing block names a deterministic
+    # route inferred from the trajectory, and it carries NO deterministic-render fields.
+    assert result.eval_answer.chunks == []
+    assert result.eval_answer.sources == []
+    assert result.eval_answer.routing["executed_route"] == "aggregation"
+    assert result.eval_answer.routing["composed_by"] == "agent"
+    assert "row_count" not in result.eval_answer.routing
+    assert "executed_query" not in result.eval_answer.routing
+
+    # A judge reply for the relevance-only rubric (the deterministic route path).
+    judge_llm = _JudgeLLM(
+        '{"answer_relevance": {"score": 5, "severity": "none", "reason": "Directly answers."},'
+        ' "findings": []}')
+    verdict = Judge(llm=judge_llm).evaluate(result.eval_answer)
+    # The core fix: faithfulness is SKIPPED (not_applicable), never scored critical, and the gate PASSES.
+    assert verdict.faithfulness.severity == NOT_APPLICABLE
+    assert verdict.faithfulness.severity != "critical"
+    assert verdict.overall_pass is True
+    # The relevance-only rubric ran (not the passage-faithfulness one).
+    assert "DETERMINISTIC database query" in judge_llm.last_system
+    # LLM-composed agent answer → NO bogus "rendered from the executed query" consistency note.
+    assert not any("result-consistency" in f for f in verdict.findings)
+
+
+def test_pure_lookup_chat_answer_routes_to_lookup(fixture_sidecar):
+    """A /chat turn whose only metadata hop is a `lookup` derives executed_route='lookup' (still a
+    DETERMINISTIC route → faithfulness skipped), not the generic 'aggregation'."""
+    from rageval.eval import NOT_APPLICABLE, Judge
+
+    llm = ScriptedLLM([
+        _tool("query_metadata", {"intent": "lookup", "filter": {"project_id": "1"}}),
+        _final("Project 1 is Alpha, published by Maple."),
+    ])
+    agent = ChatAgent(StubPipeline(llm=llm), llm=llm)
+    result = agent.chat("look up project 1")
+    assert result.eval_answer.routing["executed_route"] == "lookup"
+
+    judge_llm = _JudgeLLM(
+        '{"answer_relevance": {"score": 5, "severity": "none", "reason": "ok"}, "findings": []}')
+    verdict = Judge(llm=judge_llm).evaluate(result.eval_answer)
+    assert verdict.faithfulness.severity == NOT_APPLICABLE
+    assert verdict.overall_pass is True
+
+
+def test_semantic_chat_answer_still_graded_against_chunks_and_can_fail(fixture_sidecar):
+    """No regression: a /chat answer that used semantic_search is graded SEMANTICALLY against the
+    gathered chunks (routing stays None → executed_route defaults to 'semantic'), so a genuinely
+    unfaithful answer over real retrieved evidence STILL fails — we don't blanket-skip the agent."""
+    from rageval.eval import NOT_APPLICABLE, Judge
+
+    llm = ScriptedLLM([
+        _tool("semantic_search", {"query": "describe Alpha"}),
+        _final("Alpha is fruit-themed [1]."),
+    ])
+    agent = ChatAgent(StubPipeline(llm=llm), llm=llm)
+    result = agent.chat("describe Alpha")
+    # Semantic trajectory → no routing override; chunks were gathered for the judge to grade against.
+    assert result.eval_answer.routing is None
+    assert result.eval_answer.chunks
+
+    bad = ('{"faithfulness": {"score": 1, "severity": "critical", "reason": "Hallucinated."},'
+           ' "answer_relevance": {"score": 5, "severity": "none", "reason": "On topic."},'
+           ' "findings": []}')
+    verdict = Judge(llm=_JudgeLLM(bad)).evaluate(result.eval_answer)
+    assert verdict.faithfulness.severity == "critical"
+    assert verdict.faithfulness.severity != NOT_APPLICABLE
+    assert verdict.overall_pass is False
+
+
+def test_hybrid_chat_answer_graded_against_chunks_not_false_failed(fixture_sidecar):
+    """A HYBRID /chat turn (BOTH query_metadata and semantic_search) is graded semantically against
+    the gathered chunks — the presence of a metadata hop must NOT trigger the faithfulness-skip, so
+    the answer is graded normally (and is NOT false-failed for the aggregation portion)."""
+    from rageval.eval import Judge
+
+    llm = ScriptedLLM([
+        _tool("query_metadata",
+              {"intent": "list", "field": "app_name", "filter": {"app_category": "game"}}),
+        _tool("semantic_search", {"query": "describe the theme of Alpha"}),
+        _final("The games are Alpha, Gamma, Delta; Alpha has a fruit theme [1]."),
+    ])
+    agent = ChatAgent(StubPipeline(llm=llm), llm=llm)
+    result = agent.chat("list the games and describe the first one's theme")
+    # A semantic hop ran → routing override is None (graded semantically), chunks gathered.
+    assert result.eval_answer.routing is None
+    assert result.eval_answer.chunks
+
+    good = ('{"faithfulness": {"score": 5, "severity": "none", "reason": "Supported."},'
+            ' "answer_relevance": {"score": 5, "severity": "none", "reason": "On topic."},'
+            ' "findings": []}')
+    judge_llm = _JudgeLLM(good)
+    verdict = Judge(llm=judge_llm).evaluate(result.eval_answer)
+    assert verdict.overall_pass is True
+    # The full faithfulness+relevance rubric ran (graded against chunks, not the relevance-only one).
+    assert "CONTEXT passages" in judge_llm.last_system
+
+
+def test_failed_metadata_only_turn_is_not_routed_aggregation(fixture_sidecar, monkeypatch):
+    """Defensive: if the ONLY metadata hop FAILED (no successful tool at all), we do NOT claim a
+    deterministic route — routing stays None so the honest no-info answer is graded normally."""
+    def boom(*a, **k):
+        raise RuntimeError("boom")
+    monkeypatch.setattr(aggregate, "execute", boom)
+    llm = ScriptedLLM([
+        _tool("query_metadata", {"intent": "count"}),
+        _final("I couldn't consult the metadata."),
+    ])
+    agent = ChatAgent(StubPipeline(llm=llm), llm=llm)
+    result = agent.chat("count please")
+    assert result.trajectory[0].ok is False
+    assert result.eval_answer.routing is None
+
+
 # -- SEC-H1: observations are spotlighted as inert data in the prompt -------
 
 def test_observations_are_spotlighted_in_prompt(fixture_sidecar):
