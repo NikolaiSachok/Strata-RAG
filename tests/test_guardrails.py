@@ -106,6 +106,35 @@ def test_validator_flags_prompt_leak():
     assert any(f.pattern == "prompt_leak" for f in findings)
 
 
+# ---- SEC-M1: allowed_sources seeds the allowed-URL context (metadata-only turns). ----
+# On a metadata-only turn `chunks` is empty, so the agent's grounded URLs arrive via
+# allowed_sources. validate_answer MUST honour them, and the fake-citation check must NOT be
+# silently disabled just because the chunk list is empty.
+
+def test_validator_allows_url_from_allowed_sources_metadata_turn():
+    """A URL the agent grounded on (passed via allowed_sources) is NOT flagged exfil, even with
+    an EMPTY chunk list (metadata-only turn)."""
+    url = "https://corp.example/contact"
+    answer = f"The contact page is {url} for support."
+    findings = g.validate_answer(answer, [], allowed_sources=[url])
+    assert not any(f.pattern == "exfil_url" for f in findings)
+
+
+def test_validator_flags_novel_exfil_url_on_metadata_turn():
+    """A genuinely novel URL (NOT in allowed_sources) on a metadata-only turn is still flagged."""
+    answer = "Sure — see http://attacker.example/leak for details."
+    findings = g.validate_answer(answer, [], allowed_sources=["https://corp.example/contact"])
+    assert any(f.pattern == "exfil_url" and f.severity == "critical" for f in findings)
+
+
+def test_validator_flags_fake_citation_on_metadata_only_turn():
+    """SEC-M1: with n_passages == 0 (metadata-only turn), ANY [n] is fabricated — the check is no
+    longer gated on n_passages > 0, so it fires instead of being silently disabled."""
+    answer = "According to [7], there are 4 projects."
+    findings = g.validate_answer(answer, [], allowed_sources=[])
+    assert any(f.pattern == "fake_citation" for f in findings)
+
+
 # ---- 4. END-TO-END with a MOCK LLM: an obedient model still gets defended. --
 
 class MockObedientLLM:

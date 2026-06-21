@@ -30,9 +30,13 @@ Real questions over a project corpus split into **two classes**, and a pure embe
 | "themes used in *both* source-sets" | **set intersection over a facet** | metadata filter + semantic |
 
 A vector top-k cannot count or intersect. So ingest produces **BOTH** a semantic index
-(Qdrant) **and** a structured project-metadata table (SQLite sidecar). Phase 1 (this repo)
-builds both indexes and the eval to prove retrieval; a later phase adds an agentic router
-that picks the right mechanism per question.
+(Qdrant) **and** a structured project-metadata table (SQLite sidecar). Phase 1 builds both
+indexes and the eval to prove retrieval; **Phase 2 adds a query ROUTER** (`router.py` /
+`dispatch.py`) that picks the right mechanism per question, and an **agentic CHATBOT**
+(`agent.py`) that wraps the router in a multi-turn ReAct loop — it can **chain** the two
+engines (metadata-filter → semantic, or semantic → aggregate) to decompose a compound
+question, and returns its **trajectory** (the ordered tool calls) so the derivation is
+auditable. Served at `POST /chat` alongside the single-shot `POST /ask`.
 
 ---
 
@@ -58,8 +62,12 @@ indexed engine
    │  generate.py      ── augmented prompt → grounded answer + citations
    │  eval.py          ── Recall@K / Precision@K / MRR / nDCG (golden set) + LLM-judge faithfulness
    │  inspect.py       ── browse the actual chunks / coverage / sidecar / quality flags
+   │  router.py        ── classify a question → semantic | aggregation | lookup | hybrid (transparent)
+   │  dispatch.py      ── run the chosen engine + attach a routing block (single-shot)
+   │  agent.py         ── multi-turn ReAct loop: chain semantic + aggregation tools → composed answer
    ▼
-{answer, sources, eval}   ←── served by api.py  (POST /ask)
+{answer, sources, eval, routing}            ←── api.py  POST /ask   (single-shot router)
+{answer, sources, trajectory, eval, …}      ←── api.py  POST /chat  (multi-turn agent)
 ```
 
 | File | What it teaches |
@@ -75,7 +83,10 @@ indexed engine
 | `rerank.py` | Why a **cross-encoder** beats bi-encoders, and the **retrieve-then-rerank** pattern. |
 | `enrich.py` + `sidecar.py` | **Metadata extraction** → a **SQLite** table that answers exact **aggregation/intersection** queries a vector index can't. |
 | `metrics.py` + `eval.py` | **Recall@K / Precision@K / MRR / nDCG** (pure, tested) over a **golden set**, plus the existing **LLM-as-judge** faithfulness gate. |
-| `api.py` / `llm.py` / `config.py` | FastAPI service; dual Anthropic backend (API key **or** `claude` CLI); all tunables in one env-overridable place. |
+| `router.py` / `dispatch.py` | The **query router**: classify each question (rule pre-filter, then an LLM classifier) into semantic / aggregation / lookup / hybrid, run the chosen engine, and attach a **transparent routing block**. |
+| `aggregate.py` | The **templated-intent executor** over the sidecar — *text-to-intent, not text-to-SQL*: the LLM proposes a structured intent, vetted templates + a column whitelist enforce it (read-only, parameterised). |
+| `agent.py` | The **agentic chatbot**: a multi-turn **ReAct loop** exposing two tools (`semantic_search`, `query_metadata`) the model can **chain** to decompose a compound question; guardrails wrap every untrusted hop; returns the **trajectory**. |
+| `api.py` / `llm.py` / `config.py` | FastAPI service (`POST /ask`, `POST /chat`); dual Anthropic backend (API key **or** `claude` CLI); all tunables in one env-overridable place. |
 
 ---
 
