@@ -23,15 +23,38 @@ from pathlib import Path
 PACKAGE_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = PACKAGE_DIR.parent
 SAMPLE_CORPUS_DIR = PROJECT_ROOT / "data" / "sample"  # the synthetic, committed corpus
+
+# DATA_DIR is the folder the engine's *mutable / corpus-specific* data resolves under: the
+# metadata sidecar, corpus-rules.yaml, the golden eval set, the manifests, and (when no more
+# specific override is set) the roster TSVs. It defaults to PROJECT_ROOT so the bundled sample
+# corpus + every existing behaviour are byte-for-byte UNCHANGED with no env set.
+#
+# WHY this exists: after the open-core split the engine ships as its own package that a
+# *consuming overlay* pip-installs, while the overlay's REAL data (sidecar, rules, golden,
+# manifests) lives WITH the overlay — not inside the engine's package dir. Hardcoding these to
+# PROJECT_ROOT makes the served engine look for the sidecar in its own install dir, so
+# aggregation/lookup queries fail ("unable to open database file"). RAGEVAL_DATA_DIR lets an
+# overlay point the engine at its own data folder with ONE env var (companion to
+# RAGEVAL_PLUGINS_DIR for adapters and RAGEVAL_ROSTER_DIR for rosters).
+#
+# Read at IMPORT time so the module-level path constants below — used as default params like
+# `def connect(path=SIDECAR_PATH)` — reflect the override.
+# `.strip()` so an empty OR whitespace-only env value falls back to PROJECT_ROOT, rather than a
+# truthy "   " resolving to a literal-space dir (the classic empty-env footgun).
+_data_dir_env = os.environ.get("RAGEVAL_DATA_DIR", "").strip()
+DATA_DIR = Path(_data_dir_env).expanduser().resolve() if _data_dir_env else PROJECT_ROOT
+
 # Roster TSVs (project-id → authoritative publisher; see roster.py). The synthetic sample
 # rosters (data/sample/*.tsv) ship with the repo. The loader is GENERIC and degrades to null
 # when a roster file is absent (a corpus need not supply a roster at all).
-ROSTER_DIR = PROJECT_ROOT / "data"                     # top-level rosters (for a custom corpus)
+# Based on DATA_DIR so an overlay's RAGEVAL_DATA_DIR also relocates the top-level roster dir;
+# RAGEVAL_ROSTER_DIR still takes precedence (resolved in roster.py / Settings.load).
+ROSTER_DIR = DATA_DIR / "data"                         # top-level rosters (for a custom corpus)
 SAMPLE_ROSTER_DIR = SAMPLE_CORPUS_DIR                  # fictional sample rosters
-RULES_PATH = PROJECT_ROOT / "corpus-rules.yaml"         # the trusted relevance ruleset
-GOLDEN_PATH = PROJECT_ROOT / "eval" / "golden.yaml"     # labelled eval questions
-SIDECAR_PATH = PROJECT_ROOT / "rageval.sqlite"          # structured metadata sidecar (gitignored)
-MANIFEST_DIR = PROJECT_ROOT / "manifests"               # dry-run manifests (gitignored)
+RULES_PATH = DATA_DIR / "corpus-rules.yaml"            # the trusted relevance ruleset
+GOLDEN_PATH = DATA_DIR / "eval" / "golden.yaml"        # labelled eval questions
+SIDECAR_PATH = DATA_DIR / "rageval.sqlite"             # structured metadata sidecar (gitignored)
+MANIFEST_DIR = DATA_DIR / "manifests"                  # dry-run manifests (gitignored)
 
 # Base name for the Qdrant collection (the "table" the chunks live in). The ACTUAL name is
 # DERIVED PER EMBEDDING MODEL (see Settings.collection_name) so two models' indexes coexist
