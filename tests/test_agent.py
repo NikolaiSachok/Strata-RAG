@@ -662,25 +662,128 @@ class _JudgeLLM:
     def __init__(self, reply: str):
         self._reply = reply
         self.last_system = ""
+        self.last_prompt = ""
 
     def complete(self, system: str, prompt: str, max_tokens: int = 600) -> str:
         self.last_system = system
+        self.last_prompt = prompt
         return self._reply
 
 
 # ===========================================================================
-# #16b: route-aware eval on the AGENT path. A pure-aggregation /chat answer
-# (only query_metadata → sources:[]) must NOT be false-failed on passage-
-# faithfulness; a semantic/hybrid /chat answer must still be graded against the
-# gathered chunks (and can still fail a genuinely unfaithful answer).
+# #26 / #27: ground AGENT faithfulness against the FULL evidence — the gathered
+# semantic chunks PLUS the metadata/aggregation TOOL OBSERVATIONS. This REPLACES
+# the #23 agent-path faithfulness SKIP with real grounding: a count cited from a
+# group-by result is faithful, a MIS-RENDERED count fails, a genuine hallucination
+# (in neither chunks nor tool results) still fails. The metadata observation is
+# threaded in FULL (#27 — not truncated) so the judge sees the complete evidence.
+# (The DISPATCH `/ask` deterministic skip + #21 invariant live in dispatch.py and
+# stay intact — covered by tests/test_eval_schema.py.)
 # ===========================================================================
 
-def test_pure_aggregation_chat_answer_passes_route_aware_judge(fixture_sidecar):
-    """THE REGRESSED SCENARIO (#16b): a pure-aggregation /chat answer (agent used ONLY
-    query_metadata, so sources:[] and no chunks) graded through the REAL route-aware Judge →
-    overall_pass:true, faithfulness NOT critical (skipped / not_applicable). Before the fix the
-    eval_answer had no routing block → eval defaulted to 'semantic' → passage-faithfulness ran
-    against EMPTY context → faithfulness:1/critical → overall_pass:false on a correct answer."""
+def test_live_hybrid_count_grounds_against_tool_observation(fixture_sidecar):
+    """THE LIVE BUG (#26): a HYBRID /chat answer that used semantic_search AND a query_metadata
+    group-by, whose answer cites COUNTS that came from the metadata tool observation (NOT from a
+    chunk). Before the fix faithfulness graded the answer against the CHUNKS ALONE — so the
+    tool-sourced counts looked hallucinated → faithfulness:critical on a CORRECT answer.
+
+    With a SCRIPTED judge we assert the WIRING the fix puts in place, not a live model's judgement:
+    the group-by counts reach the eval CONTEXT (so they're available to ground against), the FULL
+    faithfulness+relevance rubric runs (agent answers carry no routing block → not skipped), the
+    tool result reaches the judge PROMPT, and a 'faithful' verdict therefore passes the gate."""
+    from rageval.eval import NOT_APPLICABLE, Judge
+
+    llm = ScriptedLLM([
+        _tool("query_metadata", {"intent": "group_by_count", "field": "publisher", "filter": None}),
+        _tool("semantic_search", {"query": "describe the theme of Alpha"}),
+        _final("Maple has 2 projects and Cedar has 2; Alpha has a fruit theme [1]."),
+    ])
+    agent = ChatAgent(StubPipeline(llm=llm), llm=llm)
+    result = agent.chat("how many projects per publisher, and describe Alpha's theme?")
+
+    # Full evidence: chunks gathered AND the group-by observation threaded in for grounding.
+    assert result.eval_answer.chunks
+    assert result.eval_answer.tool_observations
+    assert any("Maple: 2" in o and "Cedar: 2" in o for o in result.eval_answer.tool_observations)
+    # The eval CONTEXT contains BOTH the passages and the tool result (so counts are grounded).
+    ctx = result.eval_answer.context_text()
+    assert "Maple: 2" in ctx and "Cedar: 2" in ctx
+    assert result.eval_answer.routing is None   # agent path is always GRADED, never skipped
+
+    # A scripted judge returning a 'faithful' verdict → with the counts wired into CONTEXT, the
+    # gate PASSES. (We assert the wiring + gate, not that a live judge discriminates.)
+    good = ('{"faithfulness": {"score": 5, "severity": "none", "reason": "Counts match the tool result."},'
+            ' "answer_relevance": {"score": 5, "severity": "none", "reason": "On topic."},'
+            ' "findings": []}')
+    judge_llm = _JudgeLLM(good)
+    verdict = Judge(llm=judge_llm).evaluate(result.eval_answer)
+    assert verdict.overall_pass is True
+    assert verdict.faithfulness.severity != "critical"
+    assert verdict.faithfulness.severity != NOT_APPLICABLE   # GROUNDED, not skipped
+    # The full faithfulness+relevance rubric ran, and the tool result reached the judge's prompt.
+    assert "CONTEXT passages" in judge_llm.last_system
+    assert "Maple: 2" in judge_llm.last_prompt
+
+
+def test_mis_rendered_count_fails_against_tool_observation(fixture_sidecar):
+    """THE NEW CHECK (#26): an agent answer whose stated count CONTRADICTS the tool observation
+    (says "16" while the group-by result said "2"). What we ASSERT here (with a scripted judge) is
+    the WIRING that makes the contradiction catchable: the true counts reach the eval CONTEXT, the
+    answer is GRADED (routing is None → not skipped), and a faithfulness-fail verdict propagates to
+    the gate. This is the blind-spot the #23 skip left open; grounding the tool result into the
+    judge CONTEXT is what closes it (a live judge then has the evidence to discriminate)."""
+    from rageval.eval import Judge
+
+    llm = ScriptedLLM([
+        _tool("query_metadata", {"intent": "group_by_count", "field": "publisher", "filter": None}),
+        _final("Maple has 16 projects and Cedar has 9."),   # CONTRADICTS the group-by (2 and 2)
+    ])
+    agent = ChatAgent(StubPipeline(llm=llm), llm=llm)
+    result = agent.chat("how many projects per publisher?")
+
+    # The true counts are in CONTEXT; the answer mis-renders them.
+    ctx = result.eval_answer.context_text()
+    assert "Maple: 2" in ctx and "Cedar: 2" in ctx
+    assert result.eval_answer.routing is None
+
+    # A scripted judge returning a faithfulness-fail verdict propagates to the gate; the tool
+    # result "2/2" is in CONTEXT so a live judge would have the evidence to flag the "16/9" answer.
+    bad = ('{"faithfulness": {"score": 1, "severity": "critical",'
+           ' "reason": "Answer says 16/9 but the tool result is 2/2."},'
+           ' "answer_relevance": {"score": 5, "severity": "none", "reason": "On topic."},'
+           ' "findings": ["mis-rendered count"]}')
+    verdict = Judge(llm=_JudgeLLM(bad)).evaluate(result.eval_answer)
+    assert verdict.faithfulness.severity == "critical"
+    assert verdict.overall_pass is False
+
+
+def test_genuine_hallucination_in_neither_chunks_nor_tools_fails(fixture_sidecar):
+    """A claim present in NEITHER the chunks NOR the tool observations still FAILS as a
+    hallucination — grounding against more evidence must not become a blanket pass."""
+    from rageval.eval import Judge
+
+    llm = ScriptedLLM([
+        _tool("query_metadata", {"intent": "count", "field": None, "filter": None}),
+        _final("There are 4 projects, all founded in 1850 by a royal charter."),  # fabricated
+    ])
+    agent = ChatAgent(StubPipeline(llm=llm), llm=llm)
+    result = agent.chat("how many projects, and any history?")
+    assert result.eval_answer.routing is None
+    # The fabricated history is in neither the (empty) chunks nor the count observation.
+    assert "1850" not in result.eval_answer.context_text()
+
+    bad = ('{"faithfulness": {"score": 1, "severity": "critical", "reason": "Fabricated history."},'
+           ' "answer_relevance": {"score": 5, "severity": "none", "reason": "On topic."},'
+           ' "findings": ["hallucinated founding date"]}')
+    verdict = Judge(llm=_JudgeLLM(bad)).evaluate(result.eval_answer)
+    assert verdict.faithfulness.severity == "critical"
+    assert verdict.overall_pass is False
+
+
+def test_pure_aggregation_agent_answer_grounds_against_tool_observation(fixture_sidecar):
+    """A PURE-aggregation /chat answer (only query_metadata, no chunks) now GROUNDS against its
+    tool observation rather than skipping (#26 replaces the #23 skip). A faithful summary of the
+    group-by result passes — the count is in the CONTEXT, so faithfulness is GRADED, not skipped."""
     from rageval.eval import NOT_APPLICABLE, Judge
 
     llm = ScriptedLLM([
@@ -690,33 +793,28 @@ def test_pure_aggregation_chat_answer_passes_route_aware_judge(fixture_sidecar):
     agent = ChatAgent(StubPipeline(llm=llm), llm=llm)
     result = agent.chat("how many projects per publisher?")
 
-    # Pure-aggregation turn: no semantic chunks gathered, the routing block names a deterministic
-    # route inferred from the trajectory, and it carries NO deterministic-render fields.
+    # No chunks, but the group-by observation is threaded in as the grounding evidence.
     assert result.eval_answer.chunks == []
     assert result.eval_answer.sources == []
-    assert result.eval_answer.routing["executed_route"] == "aggregation"
-    assert result.eval_answer.routing["composed_by"] == "agent"
-    assert "row_count" not in result.eval_answer.routing
-    assert "executed_query" not in result.eval_answer.routing
+    assert result.eval_answer.routing is None          # NOT skipped — grounded + graded
+    assert any("Maple: 2" in o for o in result.eval_answer.tool_observations)
+    assert "Maple: 2" in result.eval_answer.context_text()
 
-    # A judge reply for the relevance-only rubric (the deterministic route path).
-    judge_llm = _JudgeLLM(
-        '{"answer_relevance": {"score": 5, "severity": "none", "reason": "Directly answers."},'
-        ' "findings": []}')
+    good = ('{"faithfulness": {"score": 5, "severity": "none", "reason": "Faithful summary of the result."},'
+            ' "answer_relevance": {"score": 5, "severity": "none", "reason": "Directly answers."},'
+            ' "findings": []}')
+    judge_llm = _JudgeLLM(good)
     verdict = Judge(llm=judge_llm).evaluate(result.eval_answer)
-    # The core fix: faithfulness is SKIPPED (not_applicable), never scored critical, and the gate PASSES.
-    assert verdict.faithfulness.severity == NOT_APPLICABLE
-    assert verdict.faithfulness.severity != "critical"
+    assert verdict.faithfulness.severity != NOT_APPLICABLE   # GRADED against the tool result
     assert verdict.overall_pass is True
-    # The relevance-only rubric ran (not the passage-faithfulness one).
-    assert "DETERMINISTIC database query" in judge_llm.last_system
-    # LLM-composed agent answer → NO bogus "rendered from the executed query" consistency note.
-    assert not any("result-consistency" in f for f in verdict.findings)
+    # The full rubric ran with the tool result in the prompt.
+    assert "CONTEXT passages" in judge_llm.last_system
+    assert "Maple: 2" in judge_llm.last_prompt
 
 
-def test_pure_lookup_chat_answer_routes_to_lookup(fixture_sidecar):
-    """A /chat turn whose only metadata hop is a `lookup` derives executed_route='lookup' (still a
-    DETERMINISTIC route → faithfulness skipped), not the generic 'aggregation'."""
+def test_pure_lookup_agent_answer_grounds_against_tool_observation(fixture_sidecar):
+    """A /chat turn whose only metadata hop is a `lookup`: the looked-up row is threaded in as the
+    grounding evidence, so a faithful restatement is GRADED (not skipped) and passes."""
     from rageval.eval import NOT_APPLICABLE, Judge
 
     llm = ScriptedLLM([
@@ -725,19 +823,21 @@ def test_pure_lookup_chat_answer_routes_to_lookup(fixture_sidecar):
     ])
     agent = ChatAgent(StubPipeline(llm=llm), llm=llm)
     result = agent.chat("look up project 1")
-    assert result.eval_answer.routing["executed_route"] == "lookup"
+    assert result.eval_answer.routing is None
+    assert any("Alpha" in o for o in result.eval_answer.tool_observations)
+    assert "Alpha" in result.eval_answer.context_text()
 
-    judge_llm = _JudgeLLM(
-        '{"answer_relevance": {"score": 5, "severity": "none", "reason": "ok"}, "findings": []}')
-    verdict = Judge(llm=judge_llm).evaluate(result.eval_answer)
-    assert verdict.faithfulness.severity == NOT_APPLICABLE
+    good = ('{"faithfulness": {"score": 5, "severity": "none", "reason": "Matches the looked-up row."},'
+            ' "answer_relevance": {"score": 5, "severity": "none", "reason": "ok"}, "findings": []}')
+    verdict = Judge(llm=_JudgeLLM(good)).evaluate(result.eval_answer)
+    assert verdict.faithfulness.severity != NOT_APPLICABLE
     assert verdict.overall_pass is True
 
 
 def test_semantic_chat_answer_still_graded_against_chunks_and_can_fail(fixture_sidecar):
-    """No regression: a /chat answer that used semantic_search is graded SEMANTICALLY against the
-    gathered chunks (routing stays None → executed_route defaults to 'semantic'), so a genuinely
-    unfaithful answer over real retrieved evidence STILL fails — we don't blanket-skip the agent."""
+    """No regression: a /chat answer that used ONLY semantic_search is graded SEMANTICALLY against
+    the gathered chunks (no tool observations to thread), so a genuinely unfaithful answer over
+    real retrieved evidence STILL fails — unchanged from before #26."""
     from rageval.eval import NOT_APPLICABLE, Judge
 
     llm = ScriptedLLM([
@@ -746,9 +846,9 @@ def test_semantic_chat_answer_still_graded_against_chunks_and_can_fail(fixture_s
     ])
     agent = ChatAgent(StubPipeline(llm=llm), llm=llm)
     result = agent.chat("describe Alpha")
-    # Semantic trajectory → no routing override; chunks were gathered for the judge to grade against.
     assert result.eval_answer.routing is None
     assert result.eval_answer.chunks
+    assert result.eval_answer.tool_observations == []   # semantic-only → no tool evidence
 
     bad = ('{"faithfulness": {"score": 1, "severity": "critical", "reason": "Hallucinated."},'
            ' "answer_relevance": {"score": 5, "severity": "none", "reason": "On topic."},'
@@ -759,37 +859,10 @@ def test_semantic_chat_answer_still_graded_against_chunks_and_can_fail(fixture_s
     assert verdict.overall_pass is False
 
 
-def test_hybrid_chat_answer_graded_against_chunks_not_false_failed(fixture_sidecar):
-    """A HYBRID /chat turn (BOTH query_metadata and semantic_search) is graded semantically against
-    the gathered chunks — the presence of a metadata hop must NOT trigger the faithfulness-skip, so
-    the answer is graded normally (and is NOT false-failed for the aggregation portion)."""
-    from rageval.eval import Judge
-
-    llm = ScriptedLLM([
-        _tool("query_metadata",
-              {"intent": "list", "field": "app_name", "filter": {"app_category": "game"}}),
-        _tool("semantic_search", {"query": "describe the theme of Alpha"}),
-        _final("The games are Alpha, Gamma, Delta; Alpha has a fruit theme [1]."),
-    ])
-    agent = ChatAgent(StubPipeline(llm=llm), llm=llm)
-    result = agent.chat("list the games and describe the first one's theme")
-    # A semantic hop ran → routing override is None (graded semantically), chunks gathered.
-    assert result.eval_answer.routing is None
-    assert result.eval_answer.chunks
-
-    good = ('{"faithfulness": {"score": 5, "severity": "none", "reason": "Supported."},'
-            ' "answer_relevance": {"score": 5, "severity": "none", "reason": "On topic."},'
-            ' "findings": []}')
-    judge_llm = _JudgeLLM(good)
-    verdict = Judge(llm=judge_llm).evaluate(result.eval_answer)
-    assert verdict.overall_pass is True
-    # The full faithfulness+relevance rubric ran (graded against chunks, not the relevance-only one).
-    assert "CONTEXT passages" in judge_llm.last_system
-
-
-def test_failed_metadata_only_turn_is_not_routed_aggregation(fixture_sidecar, monkeypatch):
-    """Defensive: if the ONLY metadata hop FAILED (no successful tool at all), we do NOT claim a
-    deterministic route — routing stays None so the honest no-info answer is graded normally."""
+def test_failed_metadata_only_turn_threads_no_tool_observation(fixture_sidecar, monkeypatch):
+    """Defensive: if the ONLY metadata hop FAILED (no successful tool), no tool observation is
+    threaded (we only ground against SUCCESSFUL results), and the honest no-info answer is graded
+    semantically against the (empty) context as before."""
     def boom(*a, **k):
         raise RuntimeError("boom")
     monkeypatch.setattr(aggregate, "execute", boom)
@@ -801,6 +874,69 @@ def test_failed_metadata_only_turn_is_not_routed_aggregation(fixture_sidecar, mo
     result = agent.chat("count please")
     assert result.trajectory[0].ok is False
     assert result.eval_answer.routing is None
+    assert result.eval_answer.tool_observations == []   # failed hop → no evidence threaded
+
+
+# ===========================================================================
+# #27: metadata/aggregation observations are NOT truncated — a group-by with many
+# groups reaches the agent (and the eval) IN FULL, so the agent doesn't under-count
+# and the judge has the complete evidence. Semantic free-text keeps its sane bound.
+# ===========================================================================
+
+def test_group_by_observation_not_truncated_full_set_reaches_agent_and_eval(tmp_path, monkeypatch):
+    """#27: a group_by_count over MANY distinct groups must reach the agent's prompt AND the eval
+    context IN FULL — even when the semantic-text cap (_OBSERVATION_CHARS) is small. We clamp that
+    cap tiny to prove metadata is exempt: every group survives in the re-fed prompt and in the
+    eval's tool_observations (so the agent can count accurately and the judge sees the whole list)."""
+    import rageval.agent as agent_mod
+
+    # A sidecar with MANY distinct app_name groups → a long rendered group-by observation.
+    db = tmp_path / "side.sqlite"
+    conn = connect(db)
+    n_groups = 40
+    for i in range(n_groups):
+        upsert_project(conn, ProjectRecord(
+            project_id=str(i), source_set="northwind", publisher="Maple",
+            app_name=f"App{i:02d}", chunk_count=1))
+    conn.close()
+    monkeypatch.setattr(aggregate, "SIDECAR_PATH", db)
+    # Make the SEMANTIC cap tiny: if metadata were (wrongly) subject to it, groups would be cut off.
+    monkeypatch.setattr(agent_mod, "_OBSERVATION_CHARS", 20)
+
+    llm = ScriptedLLM([
+        _tool("query_metadata", {"intent": "group_by_count", "field": "app_name", "filter": None}),
+        _final(f"There are {n_groups} distinct apps, one project each."),
+    ])
+    agent = ChatAgent(StubPipeline(llm=llm), llm=llm)
+    result = agent.chat("how many projects per app name?")
+
+    # The FULL group-by observation reached the eval (every group present, none truncated).
+    obs = "\n".join(result.eval_answer.tool_observations)
+    assert "App00: 1" in obs and f"App{n_groups - 1:02d}: 1" in obs
+    # And it reached the agent's NEXT prompt in full (the final compose step saw the whole list),
+    # despite the tiny semantic cap that would have cut a free-text observation.
+    final_prompt = llm.calls[-1]
+    assert "App00: 1" in final_prompt and f"App{n_groups - 1:02d}: 1" in final_prompt
+
+
+def test_semantic_observation_still_bounded(tmp_path, monkeypatch):
+    """The flip side of #27: a SEMANTIC free-text observation keeps its _OBSERVATION_CHARS bound so
+    a huge retrieval can't blow the prompt — only metadata results are exempt from truncation."""
+    import rageval.agent as agent_mod
+    monkeypatch.setattr(agent_mod, "_OBSERVATION_CHARS", 30)
+
+    long_answer = "FRUIT " * 200  # ~1200 chars of semantic free text
+    pipe = StubPipeline(answer_text=long_answer)
+    llm = ScriptedLLM([
+        _tool("semantic_search", {"query": "describe"}),
+        _final("ok."),
+    ])
+    pipe.llm = llm
+    agent = ChatAgent(pipe, llm=llm)
+    agent.chat("describe at length")
+    # The semantic observation was truncated to the (tiny) cap before re-entering the prompt.
+    final_prompt = llm.calls[-1]
+    assert long_answer not in final_prompt
 
 
 # -- SEC-H1: observations are spotlighted as inert data in the prompt -------
@@ -818,3 +954,129 @@ def test_observations_are_spotlighted_in_prompt(fixture_sidecar):
     sentinel = result.guardrail.sentinel
     assert sentinel
     assert sentinel in llm.calls[-1]
+
+
+# ===========================================================================
+# PII (MEDIUM-1): contact_emails is an ALLOWED_FIELD rendered VERBATIM by a
+# lookup / SELECT *. A personal email in the sidecar must NOT reach the re-fed
+# agent prompt NOR the eval judge context un-redacted — the metadata observation
+# is run through the ingest-time `redact` primitive before it is used.
+# ===========================================================================
+
+def _email_sidecar(tmp_path, monkeypatch, emails):
+    """A one-row sidecar whose contact_emails holds `emails`, so a lookup renders them verbatim."""
+    db = tmp_path / "side.sqlite"
+    conn = connect(db)
+    upsert_project(conn, ProjectRecord(
+        project_id="5", source_set="northwind", publisher="Maple",
+        app_name="Echo", contact_emails=list(emails), chunk_count=1))
+    conn.close()
+    monkeypatch.setattr(aggregate, "SIDECAR_PATH", db)
+    return db
+
+
+def test_personal_email_not_in_judge_context_or_agent_prompt(tmp_path, monkeypatch):
+    """MEDIUM-1: a PERSONAL contact_emails value is redacted out of the metadata observation, so it
+    reaches NEITHER the eval judge CONTEXT (context_text / tool_observations) NOR the re-fed agent
+    prompt verbatim — only the [REDACTED_EMAIL] placeholder does."""
+    personal = "jane.doe.personal@example.com"
+    _email_sidecar(tmp_path, monkeypatch, [personal])
+    llm = ScriptedLLM([
+        _tool("query_metadata", {"intent": "lookup", "filter": {"project_id": "5"}}),
+        _final("Looked up project 5."),
+    ])
+    agent = ChatAgent(StubPipeline(llm=llm), llm=llm)
+    result = agent.chat("look up project 5's contact")
+
+    # The raw personal email is nowhere in the eval evidence the judge would grade.
+    ctx = result.eval_answer.context_text()
+    assert personal not in ctx
+    assert all(personal not in o for o in result.eval_answer.tool_observations)
+    # Nor in any prompt re-fed to the agent (the scratchpad observation was redacted in place).
+    assert all(personal not in p for p in llm.calls)
+    # The redaction placeholder is what survives (the field is still represented, just scrubbed).
+    assert "[REDACTED_EMAIL]" in ctx
+
+
+def test_published_role_email_is_preserved(tmp_path, monkeypatch):
+    """The PII pass is policy-aware (not blanket): a ROLE-based / published business contact
+    (support@) is KEPT in the metadata observation — only personal data is scrubbed."""
+    role = "support@corp.example"
+    _email_sidecar(tmp_path, monkeypatch, [role])
+    llm = ScriptedLLM([
+        _tool("query_metadata", {"intent": "lookup", "filter": {"project_id": "5"}}),
+        _final("Looked up project 5."),
+    ])
+    agent = ChatAgent(StubPipeline(llm=llm), llm=llm)
+    result = agent.chat("look up project 5's contact")
+    assert any(role in o for o in result.eval_answer.tool_observations)
+
+
+# ===========================================================================
+# COST CAP (correctness): a 5×large-group-by turn is bounded. Each metadata
+# observation is held to a generous-but-finite cap so MAX_TOOL_CALLS of maximal
+# results can't compound unboundedly across the loop / compose / judge prompts —
+# WITHOUT reintroducing the #27 under-count (a normal group-by is untouched).
+# ===========================================================================
+
+def test_metadata_cost_cap_is_a_finite_generous_bound():
+    """The cost cap is a GENEROUS but FINITE per-observation bound (not None). `_truncate_observation`
+    must enforce it on a metadata result that exceeds it — so even a maximal (MAX_LIMIT-row) group-by
+    can't push an unbounded observation into the loop / compose / judge prompts — while leaving a
+    normal-sized result byte-for-byte intact (#27 under-count stays fixed)."""
+    import rageval.agent as agent_mod
+    from rageval.agent import TOOL_METADATA, _truncate_observation
+
+    cap = agent_mod._METADATA_OBSERVATION_CHARS
+    assert isinstance(cap, int) and cap >= 8000, "expected a generous (≥8K) finite metadata cap"
+
+    # A maximal-size metadata render (above the cap) is truncated to exactly the cap.
+    oversized = "x" * (cap + 5000)
+    assert len(_truncate_observation(oversized, TOOL_METADATA)) == cap
+    # A normal-sized group-by (well under the cap) is returned untouched — no #27 under-count.
+    normal = "Grouped counts — Maple: 2; Cedar: 2."
+    assert _truncate_observation(normal, TOOL_METADATA) == normal
+
+
+def test_aggregate_cost_cap_bounds_five_distinct_group_bys(tmp_path, monkeypatch):
+    """A turn that issues MAX_TOOL_CALLS DISTINCT group-bys accumulates finite evidence: each
+    threaded metadata observation is bounded by the cap, so the TOTAL eval context (what the judge
+    prompt interpolates) is bounded by cap × MAX_TOOL_CALLS, never compounding without limit."""
+    import rageval.agent as agent_mod
+
+    cap = agent_mod._METADATA_OBSERVATION_CHARS
+    db = tmp_path / "side.sqlite"
+    conn = connect(db)
+    for i in range(20):
+        upsert_project(conn, ProjectRecord(
+            project_id=str(i), source_set="northwind", publisher=f"Pub{i % 4}",
+            app_category=f"cat{i % 3}", app_name=f"App{i:02d}", chunk_count=i % 5))
+    conn.close()
+    monkeypatch.setattr(aggregate, "SIDECAR_PATH", db)
+
+    # Five DISTINCT group-by fields → five distinct (uncached) tool observations, then compose.
+    fields = ["publisher", "app_category", "app_name", "chunk_count", "source_set"]
+    llm = ScriptedLLM([_tool("query_metadata",
+                             {"intent": "group_by_count", "field": f, "filter": None})
+                       for f in fields])
+    agent = ChatAgent(StubPipeline(llm=llm), llm=llm, max_tool_calls=5)
+    result = agent.chat("slice it five ways")
+
+    assert len(result.eval_answer.tool_observations) == 5      # five distinct observations threaded
+    assert all(len(o) <= cap for o in result.eval_answer.tool_observations)
+    # The full eval CONTEXT is bounded by the per-obs cap × the call cap (+ block scaffolding).
+    assert len(result.eval_answer.context_text()) <= cap * 5 + 2000
+
+
+def test_normal_group_by_is_not_truncated_by_cost_cap(fixture_sidecar):
+    """The cap must NOT reintroduce the #27 under-count: a NORMAL group-by (a handful of short
+    lines, far under the cap) reaches the agent and eval byte-for-byte, every group present."""
+    llm = ScriptedLLM([
+        _tool("query_metadata", {"intent": "group_by_count", "field": "publisher", "filter": None}),
+        _final("Maple: 2; Cedar: 2."),
+    ])
+    agent = ChatAgent(StubPipeline(llm=llm), llm=llm)
+    result = agent.chat("projects per publisher?")
+    obs = "\n".join(result.eval_answer.tool_observations)
+    # Both groups survive in full — nothing truncated.
+    assert "Maple: 2" in obs and "Cedar: 2" in obs

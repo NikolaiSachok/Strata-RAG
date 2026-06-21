@@ -59,15 +59,44 @@ from dataclasses import dataclass
 from . import aggregate
 from . import guardrails as g
 from .generate import Answer, RagPipeline
+from .redact import redact
 
 # A hard cap on tool calls per user turn. The loop is LLM-driven, so without a ceiling a
 # confused model could ping-pong forever (or burn budget). When the cap is hit we stop
 # calling tools and force a final answer from whatever we've gathered — bounded, predictable.
 MAX_TOOL_CALLS = 5
 
-# How much of a tool result we feed back into the next prompt as an observation. Enough for
-# the model to reason over, capped so a large aggregation/retrieval can't blow the context.
+# How much of a SEMANTIC tool result we feed back into the next prompt as an observation. Free
+# text can be arbitrarily long, so we keep a sane bound here so a big retrieval can't blow the
+# context. Metadata/aggregation results are NOT bounded by this — see below (#27).
 _OBSERVATION_CHARS = 1500
+
+# Metadata/aggregation observations (#27) are NOT subject to the small SEMANTIC _OBSERVATION_CHARS
+# cap. A `group_by_count` with many groups must reach the agent IN FULL — otherwise the agent only
+# sees the head of the list and UNDER-COUNTS (#27's bug), and the eval grounds faithfulness against
+# a truncated result. They get their OWN much larger bound instead of none at all.
+#
+# COST CAP (correctness). A single templated query is row-bounded upstream (aggregate.MAX_LIMIT =
+# 1000 rows, each a short rendered line), so ONE observation is finite. But the loop can issue up
+# to MAX_TOOL_CALLS of them, and each re-enters the loop prompt, the compose prompt, AND the judge
+# prompt — so an unbounded per-observation size would COMPOUND across calls + stages. We therefore
+# keep a GENEROUS but FINITE per-observation bound: high enough that a normal group-by (a few dozen
+# short lines — well under 1 KB) is NEVER touched (so #27's under-count bug stays fixed), yet it
+# caps a pathological maximal-LIMIT (≈1000-row) group-by so MAX_TOOL_CALLS of them can't blow the
+# context. At ~12 chars/line a full 1000-row group-by is ≈12 KB; this bound trims only that tail.
+_METADATA_OBSERVATION_CHARS: int | None = 12000
+
+
+def _truncate_observation(obs: str, tool: str) -> str:
+    """Bound an observation before it re-enters the loop / the eval context.
+
+    SEMANTIC (free-text) results keep the _OBSERVATION_CHARS cap so a large retrieval can't blow
+    the prompt. METADATA/aggregation results are passed in FULL (#27): they're already row-bounded
+    by the templated executor, and truncating a group-by-count makes the agent under-count and
+    starves the eval of the complete evidence it must check the rendered counts against."""
+    if tool == TOOL_METADATA:
+        return obs if _METADATA_OBSERVATION_CHARS is None else obs[:_METADATA_OBSERVATION_CHARS]
+    return obs[:_OBSERVATION_CHARS]
 
 # The honest fallback when we have no grounded answer (no observations, empty model reply, etc.).
 # Matches generate.py's refusal wording so the corpus-grounded contract reads the same everywhere.
@@ -461,6 +490,10 @@ class ChatAgent:
         scratch: list[str] = []           # the ReAct scratchpad (observations this turn)
         all_chunks = []                   # accumulated retrieved chunks (for eval context + cites)
         all_sources: list[str] = []
+        # #26: full metadata/aggregation tool observations gathered this turn — non-passage EVIDENCE
+        # the eval grounds faithfulness against (a count cited from a group-by result is faithful;
+        # a mis-rendered one is not). Kept un-truncated (#27) so the judge sees the complete result.
+        tool_observations: list[str] = []
         # Grounding URLs accumulated across ALL hops (semantic chunks AND metadata observations),
         # so the output guard's allowed-URL set reflects everything the agent actually saw.
         grounded_urls: set[str] = set()
@@ -515,7 +548,7 @@ class ChatAgent:
                               thought=thought, ok=ok)
                 trajectory.append(tc)
                 scratch.append(f"[{tool} args={json.dumps(args, default=str)} (cached)] → "
-                               f"{_spotlight_observation(obs[:_OBSERVATION_CHARS], sentinel)}")
+                               f"{_spotlight_observation(_truncate_observation(obs, tool), sentinel)}")
                 continue
 
             # Execute. ANY exception inside a tool becomes a failed observation, never a 500 (C1).
@@ -532,8 +565,18 @@ class ChatAgent:
             # SEC-H1: scan the observation for injection AND spotlight it before it re-enters the
             # prompt — corpus free-text (esp. a metadata SELECT *) is untrusted DATA, not orders.
             self._scan_observation(obs, tool, report)
-            framed = _spotlight_observation(obs[:_OBSERVATION_CHARS], sentinel)
+            framed = _spotlight_observation(_truncate_observation(obs, tool), sentinel)
             scratch.append(f"[{tool} args={json.dumps(args, default=str)}] → {framed}")
+            # #26: record SUCCESSFUL metadata/aggregation observations as non-passage EVIDENCE for
+            # the eval. The agent's answer may state counts/aggregates that came from this tool
+            # result (not from a retrieved chunk); threading the observation into the eval context
+            # lets the judge ground those claims — a faithful render passes, a mis-rendered count
+            # fails. Semantic results are evidence via all_chunks. We thread the SAME bounded form
+            # the agent saw (_truncate_observation): a normal group-by (well under the generous
+            # metadata cap) is byte-identical (#27 under-count stays fixed), while a pathological
+            # maximal-LIMIT result is capped so it can't compound across the judge prompt too.
+            if ok and tool == TOOL_METADATA:
+                tool_observations.append(_truncate_observation(obs, tool))
 
         # If we never got an explicit final (cap hit, or a garbled/unparsed step), force a
         # composition step from the scratchpad so the user always gets a grounded answer.
@@ -549,17 +592,24 @@ class ChatAgent:
         report.output_findings.extend(
             g.validate_answer(final_answer, all_chunks, allowed_sources=sorted(grounded_urls)))
 
-        # Build the Answer the eval Judge will grade: its context is the gathered chunks (so the
-        # judge sees the same evidence the agent composed from). ROUTE-AWARE (#16): attach a routing
-        # block derived from the TRAJECTORY when the turn used ONLY metadata/aggregation tools, so the
-        # Judge skips passage-faithfulness for a pure-aggregation answer (empty `sources` is correct,
-        # not a hallucination). A semantic / hybrid trajectory gets routing=None → graded against the
-        # gathered chunks as before (so a genuinely unfaithful answer still fails). See
-        # _eval_routing_from_trajectory for why this never trips the #21 dispatch invariant.
+        # Build the Answer the eval Judge will grade. Its CONTEXT is the FULL evidence the agent
+        # actually used (#26): the gathered semantic chunks PLUS the metadata/aggregation TOOL
+        # OBSERVATIONS, threaded via Answer.tool_observations so context_text() appends them. The
+        # judge therefore grades faithfulness against everything:
+        #   * a claim grounded in a chunk OR a tool result → faithful;
+        #   * a claim in NEITHER → still a hallucination → fails;
+        #   * a MIS-RENDERED aggregate (answer says "16" but the group-by result said "2") → fails,
+        #     because the tool observation is now in the context to check against.
+        # This REPLACES the #23 agent-path faithfulness SKIP with real grounding (strictly better:
+        # it restores a faithfulness check on the LLM's rendering of the tool result, closing the
+        # blind-spot #21 flagged). routing stays None on the agent path: grounding — not a route
+        # override — is what makes a pure-aggregation agent answer pass/fail correctly, so the
+        # answer is always graded, never skipped. The DISPATCH (`/ask`) path keeps its own #23
+        # deterministic skip + invariant intact (built in dispatch.py, never here).
         eval_answer = Answer(question=question, answer=final_answer,
                              sources=_dedupe(all_sources), chunks=all_chunks,
-                             guardrail=report,
-                             routing=_eval_routing_from_trajectory(trajectory))
+                             guardrail=report, routing=None,
+                             tool_observations=list(tool_observations))
 
         return AgentResult(
             answer=final_answer,
@@ -619,7 +669,16 @@ class ChatAgent:
                 if isinstance(v, str):
                     _scan_tool_input(v, where="tool_input:query_metadata.filter", report=report)
         obs, _result, err = _run_metadata_tool(args)
+        # PII (MEDIUM-1). The chunk path is PII-redacted at INGEST, but the sidecar holds raw
+        # structured fields: `contact_emails` is an ALLOWED_FIELD rendered VERBATIM by lookup /
+        # SELECT *, so a personal email would otherwise reach the LLM (re-fed agent prompt AND the
+        # eval judge) un-redacted. DECISION: redact the observation in place — reuse the existing
+        # ingest-time `redact` primitive (secret + policy-aware PII pass) so the SAME guardrail
+        # protects the metadata channel. We pass no doc_type → the default (non-public) policy
+        # redacts personal emails while role/published contacts pass through, identical to ingest.
+        obs, _n_sec, _n_pii = redact(obs)
         # #7: a lookup/SELECT * can surface a URL stored in corpus metadata — count it as grounded.
+        # (Done AFTER redaction so a redacted credential/email can't seed the allowed-URL set.)
         grounded_urls |= g._urls_in(obs)
         return obs, err is None
 
@@ -695,67 +754,6 @@ def _strip_compose_json(text: str) -> str:
         stripped = (text[:idx] + text[end:]).strip()
         return stripped
     return text
-
-
-def _eval_routing_from_trajectory(trajectory: list[ToolCall]) -> dict | None:
-    """Derive a routing block for the EVAL judge from the tools the agent ACTUALLY used (#16).
-
-    WHY this exists. The eval Judge is route-aware (eval._executed_route): a semantic answer is
-    graded for passage-faithfulness against its CONTEXT, while a deterministic aggregation/lookup
-    answer is NOT (its CONTEXT is correctly empty — the evidence is a SQL result, not passages).
-    The DISPATCH path (`/ask`) sets that route in dispatch.py; the AGENT path (`/chat`) didn't, so a
-    pure-aggregation chat answer (only `query_metadata`, so `sources:[]`, no chunks) fell into the
-    semantic branch → passage-faithfulness ran against EMPTY context → `faithfulness:1/critical` →
-    `overall_pass:false` even though the answer was correct. We fix that by reading the trajectory.
-
-    THE RULE — derive the route from the tools used, not the question:
-      * The agent called `semantic_search` on ANY successful hop (semantic-only OR hybrid) → we
-        return None. No routing override: the eval_answer keeps `routing=None` → eval grades it
-        SEMANTICALLY against the gathered chunks (all_chunks). A genuinely unfaithful answer over
-        real retrieved evidence STILL fails — we must not blanket-skip the agent path.
-      * The agent used ONLY metadata/aggregation tools (≥1 successful `query_metadata`, NO
-        successful `semantic_search`) → return a routing block whose `executed_route` is the
-        deterministic route (`lookup` if every metadata hop was a lookup, else `aggregation`), so
-        the Judge SKIPS passage-faithfulness (empty `sources` is correct here, not a hallucination)
-        and grades answer_relevance alone.
-      * No successful tool at all → None (graded semantically over whatever was gathered, i.e. the
-        honest no-info / empty-context case — today's behaviour, no regression).
-
-    GUARDING THE #21 DISPATCH INVARIANT. dispatch._try_aggregation asserts that an aggregation
-    answer's TEXT is the DETERMINISTIC renderer output (aggregate.format_aggregation_answer), and the
-    eval faithfulness-skip is safe there precisely because of that. The AGENT's aggregation answer is
-    LLM-COMPOSED prose, NOT a deterministic render — so we must NOT route it through that dispatch
-    invariant. We don't: this block is built HERE (never via dispatch._routing_block), it carries a
-    distinct `composed_by:"agent"` marker, and it deliberately OMITS the deterministic-render fields
-    (`row_count`, `executed_query`, `params`). Omitting `row_count` also means
-    eval._result_consistency_finding returns None — the agent answer gets no spurious
-    "rendered from the executed query" note, which would be false for LLM-composed prose."""
-    metadata_intents: list[str] = []
-    for tc in trajectory:
-        if not tc.ok:
-            continue
-        if tc.tool == TOOL_SEMANTIC:
-            return None  # any successful semantic hop → grade semantically (no override)
-        if tc.tool == TOOL_METADATA:
-            metadata_intents.append(str((tc.args or {}).get("intent", "")).lower())
-
-    if not metadata_intents:
-        return None  # no successful tool → semantic/no-info default (no regression)
-
-    # Pure-aggregation/lookup trajectory: pick the deterministic route. `lookup` only if EVERY
-    # metadata hop was a lookup; otherwise it's general aggregation.
-    executed_route = "lookup" if all(i == "lookup" for i in metadata_intents) else "aggregation"
-    return {
-        "route": executed_route,
-        "executed_route": executed_route,
-        # Provenance: this route was inferred from the agent's trajectory, and the answer is
-        # LLM-COMPOSED — NOT the deterministic dispatch render. The eval skip applies; the #21
-        # dispatch deterministic-render invariant does NOT (and is never invoked on this path).
-        "composed_by": "agent",
-        "derived_from": "trajectory",
-        # Deliberately NO row_count / executed_query / params: those are the dispatch path's
-        # deterministic-render markers, and their absence keeps _result_consistency_finding quiet.
-    }
 
 
 def _dedupe(items: list[str]) -> list[str]:
