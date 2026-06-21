@@ -182,6 +182,11 @@ def shape_trajectory(data: dict[str, Any]) -> list[dict[str, Any]]:
     steps = data.get("trajectory") or []
     out: list[dict[str, Any]] = []
     for i, s in enumerate(steps, start=1):
+        # A present-but-malformed element (null or non-dict) degrades gracefully instead of
+        # crashing the whole shape_response (which the APIError handler would NOT catch). Treat
+        # it like the empty/absent case: a placeholder row with default fields.
+        if not isinstance(s, dict):
+            s = {}
         out.append(
             {
                 "n": i,
@@ -373,8 +378,11 @@ def main() -> None:  # pragma: no cover — Streamlit glue, exercised manually, 
 
         # Persist BOTH the API-facing transcript (for replay to the server) and the rich turn
         # records (for re-rendering the page). The assistant's API turn is the plain answer text.
+        # Coalesce an empty/None answer to a non-empty placeholder: the replayed transcript is
+        # POSTed back to /chat where ChatMessage.content has min_length=1, so persisting ""/None
+        # would 422 every subsequent turn and wedge the conversation until "Clear conversation".
         new_history = append_turn(history, "user", question)
-        new_history = append_turn(new_history, "assistant", view["answer"])
+        new_history = append_turn(new_history, "assistant", view["answer"] or "(no answer)")
         st.session_state["history"] = new_history
         st.session_state["turns"] = [
             *turns,

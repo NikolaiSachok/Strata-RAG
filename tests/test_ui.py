@@ -228,6 +228,50 @@ def test_shape_response_tolerates_missing_blocks():
     assert v["guardrail"]["safe"] is True
 
 
+@pytest.mark.parametrize("empty_answer", [None, ""])
+def test_empty_answer_does_not_wedge_history(empty_answer):
+    """Regression (review M1): a turn whose backend answer is empty/None must not poison the
+    replayed transcript. The persisted assistant `content` must be non-empty so the NEXT turn's
+    build_chat_request produces a body the API's ChatMessage.content (min_length=1) would accept —
+    otherwise every subsequent /chat 422s and the conversation is wedged until "Clear conversation".
+    """
+    view = ui.shape_response({"answer": empty_answer, "sources": []})
+    # This mirrors the persistence in main(): coalesce the assistant turn before appending.
+    history = ui.append_turn([], "user", "q")
+    history = ui.append_turn(history, "assistant", view["answer"] or "(no answer)")
+    assistant_turn = history[-1]
+    assert assistant_turn["role"] == "assistant"
+    assert assistant_turn["content"]                       # non-empty placeholder, not ""/None
+    assert len(assistant_turn["content"]) >= 1             # satisfies API min_length=1
+    # And the replayed transcript is a valid request body (non-empty content on every turn).
+    body = ui.build_chat_request("next", history)
+    assert all(m["content"] for m in body["history"])
+
+
+@pytest.mark.parametrize("bad_step", [None, "not-a-dict", 42, ["list"]])
+def test_shape_trajectory_skips_malformed_step(bad_step):
+    """Regression (review M2): a trajectory with a null/non-dict element must degrade gracefully
+    (like the empty/absent case) instead of raising AttributeError out of shape_response — that
+    exception would escape the APIError handler and error the whole Streamlit run."""
+    body = {
+        "answer": "ok",
+        "trajectory": [
+            {"tool": "semantic_search", "args": {}, "thought": "t", "result_summary": "1 chunk",
+             "ok": True},
+            bad_step,
+        ],
+    }
+    # No exception, and a safe view model: the malformed step becomes a default ("?") row.
+    traj = ui.shape_trajectory(body)
+    assert [s["n"] for s in traj] == [1, 2]
+    assert traj[0]["tool"] == "semantic_search"
+    assert traj[1]["tool"] == "?"
+    assert traj[1]["ok"] is True
+    # And the full shape_response path is likewise exception-free.
+    v = ui.shape_response(body)
+    assert len(v["trajectory"]) == 2
+
+
 # ===========================================================================
 # Health status line
 # ===========================================================================
