@@ -103,10 +103,32 @@ class Answer:
     # routing decision + (for aggregation) the exact templated query/params that ran. None when
     # the pipeline was called directly (semantic-only path), so existing callers are unaffected.
     routing: dict | None = None
+    # NON-PASSAGE EVIDENCE the answer was composed from (issue #26): an AGENT (/chat) answer can
+    # cite facts that came from a TOOL OBSERVATION (a metadata group-by-count, a lookup row), not
+    # from a retrieved passage. Those observations are part of the evidence the eval judge must
+    # grade faithfulness against — a count rendered from a group-by result is faithful, a mis-
+    # rendered count is NOT. The semantic pipeline never sets this (stays []), so dispatch/direct
+    # callers are unaffected; only the agent threads its tool observations through here.
+    tool_observations: list[str] = field(default_factory=list)
 
     def context_text(self) -> str:
-        """Re-render the context exactly as the model saw it (for the eval judge)."""
-        return format_context(self.chunks)
+        """Re-render the FULL evidence exactly as the answer was composed from it (for the eval
+        judge): the retrieved passages PLUS any tool observations (issue #26).
+
+        Faithfulness must be graded against EVERYTHING the answer drew on. For a plain semantic
+        answer that is just the passages (tool_observations is empty → identical to before). For
+        an agent answer that also called the metadata sidecar, the tool results (counts, group-by
+        rows, looked-up fields) are appended as additional CONTEXT so a claim grounded in a tool
+        result reads as faithful, while a claim in NEITHER the passages NOR the tool results still
+        fails as a hallucination."""
+        passages = format_context(self.chunks)
+        if not self.tool_observations:
+            return passages
+        tools = "\n\n".join(
+            f"[T{i}] (tool result)\n{obs}" for i, obs in enumerate(self.tool_observations, start=1)
+        )
+        tool_block = f"TOOL RESULTS (structured evidence, not retrieved passages):\n{tools}"
+        return f"{passages}\n\n{tool_block}" if passages else tool_block
 
 
 class RagPipeline:
