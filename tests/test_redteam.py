@@ -17,10 +17,12 @@ from rageval.guardrails import max_severity, scan_for_injection
 from rageval.redteam import encoders as enc
 from rageval.redteam import (
     BASE_INTENTS,
+    FlakyMockTarget,
     MockTarget,
     generate,
     promote_to_fixtures,
     run,
+    render_report,
     summarize,
 )
 from rageval.redteam.oracle import judge
@@ -221,6 +223,94 @@ def test_promote_empty_when_no_wins():
     records = run(robust, generate())
     assert all(not r.success for r in records)
     assert "No successful bypasses" in promote_to_fixtures(records)
+
+
+# ---------------------------------------------------------------------------
+# --trials N — per-payload success RATE (compliance is stochastic on a live model).
+# Driven by FlakyMockTarget (deterministic by trial index — NO randomness).
+# ---------------------------------------------------------------------------
+
+def test_trials_exact_rate_from_deterministic_double():
+    """comply-on-even over 4 trials → exactly 2/4 = 0.5 per payload, and ASR rate-based overall."""
+    cases = generate(families=["instruction-override"], encoders=["enclosed_alnum"],
+                     include_multiturn=False, include_indirect=False)
+    records = run(FlakyMockTarget(), cases, trials=4)
+    assert len(records) == 1
+    r = records[0]
+    assert r.trials == 4
+    assert r.complied == 2 and r.refused == 2 and r.errors == 0
+    assert r.answered == 4
+    assert r.success_rate == 0.5
+    assert r.success is True  # complied at least once
+
+    s = summarize(records)
+    assert s.trials == 4
+    assert s.asr == 0.5  # rate-based: total_complied / total_answered = 2/4
+    cell = s.by_breakdown[("instruction-override", "enclosed_alnum", "direct")]
+    assert cell["complied"] == 2 and cell["answered"] == 4 and cell["errors"] == 0
+
+
+def test_trials_errors_excluded_from_rate_denominator():
+    """An errored trial is NOT a refusal: with comply-on-even + an error on an even trial, the rate
+    is computed over ANSWERED trials only. trials=4, errors on {0}: trial0=error, trial2=comply,
+    trials 1,3=refuse → complied=1, refused=2, errors=1, answered=3, rate=1/3."""
+    cases = generate(families=["instruction-override"], encoders=["enclosed_alnum"],
+                     include_multiturn=False, include_indirect=False)
+    records = run(FlakyMockTarget(error_on={0}), cases, trials=4)
+    r = records[0]
+    assert r.errors == 1
+    assert r.complied == 1 and r.refused == 2
+    assert r.answered == 3  # errors excluded
+    assert abs(r.success_rate - (1 / 3)) < 1e-9
+
+    s = summarize(records)
+    assert s.total_errors == 1
+    assert s.total_answered == 3 and s.total_complied == 1
+    assert abs(s.asr - (1 / 3)) < 1e-9
+
+
+def test_trials_all_errors_gives_zero_rate_not_refusal():
+    """If every trial errors, answered=0 → rate 0.0 (not a divide-by-zero, not a 'refusal')."""
+    cases = generate(families=["instruction-override"], encoders=["enclosed_alnum"],
+                     include_multiturn=False, include_indirect=False)
+    records = run(FlakyMockTarget(error_on={0, 1, 2}), cases, trials=3)
+    r = records[0]
+    assert r.errors == 3 and r.answered == 0
+    assert r.success_rate == 0.0
+    assert r.success is False
+
+
+def test_trials_one_path_unchanged():
+    """trials==1 (default) keeps the original single-shot semantics and report header."""
+    cases = generate()
+    rec1 = run(MockTarget(), cases)           # default trials=1
+    rec_explicit = run(MockTarget(), cases, trials=1)
+    # Single-shot record: trials==1, and complied/refused mirror the success flag.
+    for r in rec1:
+        assert r.trials == 1
+        assert (r.complied == 1) == r.success
+        assert r.complied + r.refused + r.errors == 1
+    s1 = summarize(rec1)
+    assert s1.trials == 1
+    # Single-shot ASR is payload-fraction based, identical to the pre-trials behaviour.
+    assert s1.asr == s1.succeeded / s1.total
+    # The report keeps the single-shot column (no "success-rate" / "trials each" wording).
+    report = render_report(rec1, s1)
+    assert "model-complied" in report
+    assert "trials each" not in report
+    assert summarize(rec_explicit).asr == s1.asr
+
+
+def test_trials_report_shows_rate_and_errors_columns():
+    """trials>1 report switches to the rate view with an errors column."""
+    cases = generate(families=["instruction-override"], encoders=["enclosed_alnum"],
+                     include_multiturn=False, include_indirect=False)
+    records = run(FlakyMockTarget(error_on={0}), cases, trials=4)
+    report = render_report(records, summarize(records))
+    assert "trials each" in report
+    assert "success-rate (complied/answered)" in report
+    assert "errors" in report
+    assert "rate over answered trials" in report
 
 
 # ---------------------------------------------------------------------------

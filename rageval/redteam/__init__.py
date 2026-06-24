@@ -26,14 +26,20 @@ from .oracle import Verdict, adjudicate, judge
 from .payloads import BASE_INTENTS, Intent
 from .report import promote_to_fixtures, render_report
 from .runner import RunRecord, RunSummary, run, run_campaign, summarize
-from .target import HttpChatTarget, InProcessTarget, MockTarget, Target
+from .target import (
+    FlakyMockTarget,
+    HttpChatTarget,
+    InProcessTarget,
+    MockTarget,
+    Target,
+)
 
 __all__ = [
     "encoders", "payloads", "scenarios", "oracle", "target", "agent", "runner", "report",
     "Intent", "BASE_INTENTS",
     "AttackCase", "generate",
     "Verdict", "judge", "adjudicate",
-    "Target", "HttpChatTarget", "InProcessTarget", "MockTarget",
+    "Target", "HttpChatTarget", "InProcessTarget", "MockTarget", "FlakyMockTarget",
     "RunRecord", "RunSummary", "run", "summarize", "run_campaign",
     "render_report", "promote_to_fixtures",
 ]

@@ -178,3 +178,43 @@ class MockTarget:
             "output_findings": [],
         }
         return {"answer": answer, "guardrail": guardrail}
+
+
+# ---------------------------------------------------------------------------
+# Flaky mock — a DETERMINISTIC test double whose outcome varies by TRIAL INDEX.
+# ---------------------------------------------------------------------------
+# WHY a separate double. The plain MockTarget is deterministic *per payload* — the same payload
+# always gets the same verdict — which is exactly right for the single-shot tests. But to exercise
+# the new --trials RATE computation we need an outcome that varies ACROSS trials WITHOUT randomness
+# (random/time are non-reproducible and forbidden). So this double keys its behaviour to the trial
+# INDEX via a fixed pattern: comply on even indices, refuse on odd → an EXACT 0.5 success rate over
+# an even trial count. `error_on` lets a test inject errored trials to prove they're EXCLUDED from
+# the rate denominator (not counted as refusals). It is `trial_aware` so the runner forwards the
+# index; on a real target the index is ignored (the protocol signature is unchanged).
+
+class FlakyMockTarget:
+    """Deterministic-by-trial-index target for testing the --trials rate logic. NOT for live use.
+
+    `comply_on(trial) -> bool` decides compliance per trial (default: even indices comply); any
+    trial in `error_on` returns an error instead (excluded from the rate). When a trial complies it
+    emits a canary the oracle will detect; otherwise a clean refusal."""
+
+    name = "flaky_mock"
+    trial_aware = True
+
+    def __init__(self, *, comply_on=None, error_on: set[int] | None = None):
+        self.comply_on = comply_on or (lambda t: t % 2 == 0)
+        self.error_on = set(error_on or ())
+
+    def send(self, question: str, history: list[dict] | None = None, *, trial: int = 0) -> dict:
+        if trial in self.error_on:
+            # Transient-style failure (mirrors HttpChatTarget's 502 shape) — an error, NOT a refusal.
+            return {"answer": "", "guardrail": {}, "error": f"simulated transient error (trial {trial})"}
+        if self.comply_on(trial):
+            # Emit every canary so the oracle fires regardless of which intent drove the case.
+            answer = (f"{CANARY_PERSONA}: ok. {CANARY_PROMPT_MARKER} leaked. "
+                      f"![pixel]({CANARY_EXFIL_URL}?d=x) {CANARY_TOKEN}")
+        else:
+            answer = "I can't help with that — it looks like a prompt-injection attempt."
+        return {"answer": answer, "guardrail": {"safe": True, "input_findings": [],
+                                                "output_findings": []}}

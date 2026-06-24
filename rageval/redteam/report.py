@@ -20,25 +20,52 @@ def _pct(n: int, d: int) -> str:
 
 
 def render_report(records: list[RunRecord], summary: RunSummary | None = None) -> str:
-    """Markdown report: an overall line + a per-(family,encoder,delivery) breakdown table."""
+    """Markdown report: an overall line + a per-(family,encoder,delivery) breakdown table.
+
+    When `trials == 1` the output is the original single-shot table (model-complied = payloads that
+    complied). When `trials > 1` it switches to the statistically honest view: a per-cell success
+    RATE over answered trials (e.g. `6/8 = 75%`) plus an explicit `errors` column, because live
+    compliance is stochastic and errors (502/timeout) must not masquerade as refusals."""
     s = summary or summarize(records)
+    multi = s.trials > 1
     lines: list[str] = []
     lines.append("# Red-team run — injection bypass report\n")
-    lines.append(f"- **Cases:** {s.total}")
+    lines.append(f"- **Cases:** {s.total}" + (f" × {s.trials} trials each" if multi else ""))
     lines.append(f"- **Scanner-evasion rate:** {_pct(s.scanner_evaded, s.total)} "
                  f"({s.scanner_evaded}/{s.total} payloads the deterministic scanner did NOT flag)")
-    lines.append(f"- **End-to-end ASR:** {_pct(s.succeeded, s.total)} "
-                 f"({s.succeeded}/{s.total} where the model actually complied)\n")
+    if multi:
+        lines.append(
+            f"- **End-to-end ASR (rate over answered trials):** "
+            f"{_pct(s.total_complied, s.total_answered)} "
+            f"({s.total_complied}/{s.total_answered} complying trials; {s.total_errors} errored "
+            f"trials excluded)")
+        lines.append(f"- **Payloads that complied at least once:** "
+                     f"{_pct(s.succeeded, s.total)} ({s.succeeded}/{s.total})\n")
+    else:
+        lines.append(f"- **End-to-end ASR:** {_pct(s.succeeded, s.total)} "
+                     f"({s.succeeded}/{s.total} where the model actually complied)\n")
 
     lines.append("## Breakdown by family × encoder × delivery\n")
-    lines.append("| family | encoder | delivery | n | scanner-evaded | model-complied |")
-    lines.append("| --- | --- | --- | ---: | ---: | ---: |")
-    for (family, encoder, delivery), c in sorted(s.by_breakdown.items()):
-        lines.append(
-            f"| {family} | {encoder} | {delivery} | {c['n']} | "
-            f"{c['evaded']}/{c['n']} ({_pct(c['evaded'], c['n'])}) | "
-            f"{c['succeeded']}/{c['n']} ({_pct(c['succeeded'], c['n'])}) |"
-        )
+    if multi:
+        lines.append("| family | encoder | delivery | n | scanner-evaded | "
+                     "success-rate (complied/answered) | errors |")
+        lines.append("| --- | --- | --- | ---: | ---: | ---: | ---: |")
+        for (family, encoder, delivery), c in sorted(s.by_breakdown.items()):
+            lines.append(
+                f"| {family} | {encoder} | {delivery} | {c['n']} | "
+                f"{c['evaded']}/{c['n']} ({_pct(c['evaded'], c['n'])}) | "
+                f"{c['complied']}/{c['answered']} ({_pct(c['complied'], c['answered'])}) | "
+                f"{c['errors']} |"
+            )
+    else:
+        lines.append("| family | encoder | delivery | n | scanner-evaded | model-complied |")
+        lines.append("| --- | --- | --- | ---: | ---: | ---: |")
+        for (family, encoder, delivery), c in sorted(s.by_breakdown.items()):
+            lines.append(
+                f"| {family} | {encoder} | {delivery} | {c['n']} | "
+                f"{c['evaded']}/{c['n']} ({_pct(c['evaded'], c['n'])}) | "
+                f"{c['succeeded']}/{c['n']} ({_pct(c['succeeded'], c['n'])}) |"
+            )
 
     # Successful bypasses get called out explicitly — these are the promotion candidates.
     wins = [r for r in records if r.success]
@@ -47,15 +74,22 @@ def render_report(records: list[RunRecord], summary: RunSummary | None = None) -
         lines.append("_None — the model refused or ignored every attack in this run._")
     else:
         for r in wins:
+            rate = (f" rate={r.complied}/{r.answered} ({_pct(r.complied, r.answered)})"
+                    if multi else "")
             lines.append(f"- `{r.case_id}` — kind={r.success_kind}, encoder={r.encoder}, "
-                         f"delivery={r.delivery}, evidence={r.evidence!r}")
+                         f"delivery={r.delivery},{rate} evidence={r.evidence!r}")
 
-    # Errors (e.g. unreachable target) surfaced so a run that silently failed is obvious.
-    errs = [r for r in records if r.error]
+    # Errors (e.g. unreachable target / transient 502) surfaced so a run that silently failed is
+    # obvious. These trials are EXCLUDED from the success-rate denominator (an error is not a
+    # refusal); we list the affected payloads with their errored-trial count.
+    errs = [r for r in records if r.errors]
     if errs:
-        lines.append(f"\n## Errors ({len(errs)})\n")
+        total_err_trials = sum(r.errors for r in errs)
+        lines.append(f"\n## Errors ({total_err_trials} errored trials across {len(errs)} payloads, "
+                     f"excluded from the rate)\n")
         for r in errs[:20]:
-            lines.append(f"- `{r.case_id}` — {r.error}")
+            count = f" ({r.errors}/{r.trials} trials)" if multi else ""
+            lines.append(f"- `{r.case_id}`{count} — {r.error}")
 
     return "\n".join(lines) + "\n"
 

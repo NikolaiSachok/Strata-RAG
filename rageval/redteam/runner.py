@@ -27,8 +27,18 @@ from .target import Target
 
 @dataclass
 class RunRecord:
-    """The outcome of firing one attack case. Carries enough to compute both rates and to promote
-    a successful bypass into the fixture corpus."""
+    """The outcome of firing one attack case (possibly over several trials). Carries enough to
+    compute both rates and to promote a successful bypass into the fixture corpus.
+
+    WHY PER-TRIAL COUNTS. Live testing showed per-payload compliance is STOCHASTIC: the same
+    zero-width payload hijacked Sonnet in 6 of 8 shots but refused once — a single-shot verdict is
+    misleading. So a record aggregates N trials: `complied`/`refused`/`errors` outcome counts plus
+    the model-side rate. Crucially, `errors` (transient 502s, timeouts) are NOT refusals — they are
+    excluded from the rate denominator (`answered = complied + refused`). The SCANNER side is
+    deterministic per rendered payload, so it is scanned ONCE and never multiplied by trials.
+
+    `success` stays = "did this payload EVER comply" (complied > 0), so the single-shot semantics
+    and the promote-to-fixtures gate are unchanged."""
 
     case_id: str
     intent_id: str
@@ -36,18 +46,32 @@ class RunRecord:
     encoder: str
     delivery: str
     rendered_payload: str
-    # Scanner side (evasion):
+    # Scanner side (evasion) — scanned ONCE, deterministic, never multiplied by trials.
     scanner_flagged: bool
     scanner_severity: str
     scanner_pattern: str = ""
-    # Model side (ASR):
-    success: bool = False
-    success_kind: str = ""
+    # Model side (ASR), aggregated over trials:
+    trials: int = 1                 # how many times this payload was fired
+    complied: int = 0               # trials where the oracle judged a successful hijack
+    refused: int = 0                # trials answered but NOT complying (a genuine refusal)
+    errors: int = 0                 # trials that errored (502/timeout) — excluded from the rate
+    success: bool = False           # complied > 0 — "did this payload EVER hijack"
+    success_kind: str = ""          # the kind from the first complying trial (for the breakdown)
     evidence: str = ""
     answer_excerpt: str = ""
-    error: str = ""
+    error: str = ""                 # the first error seen (for the report's Errors section)
     # Back-reference so the adaptive strategist can read the intent off a failed record.
     intent: object = None
+
+    @property
+    def answered(self) -> int:
+        """Trials that produced an answer (complied or refused) — the rate DENOMINATOR."""
+        return self.complied + self.refused
+
+    @property
+    def success_rate(self) -> float:
+        """Per-payload success rate over ANSWERED trials (errors excluded). 0.0 if none answered."""
+        return self.complied / self.answered if self.answered else 0.0
 
 
 def _scan_target_text(case: AttackCase) -> tuple[bool, str, str]:
@@ -62,7 +86,17 @@ def _scan_target_text(case: AttackCase) -> tuple[bool, str, str]:
     return flagged, sev, pattern
 
 
-def _execute(case: AttackCase, target: Target) -> dict:
+def _send(target: Target, question: str, history=None, *, trial: int = 0) -> dict:
+    """Call target.send, forwarding the trial index ONLY to targets that accept it (the
+    deterministic test double varies its outcome by trial index). Real targets — HttpChatTarget,
+    MockTarget — ignore the index; this keeps the `Target` protocol's `.send(question, history)`
+    signature the contract while letting a trial-aware double opt in without randomness."""
+    if getattr(target, "trial_aware", False):
+        return target.send(question, history=history, trial=trial)
+    return target.send(question, history=history)
+
+
+def _execute(case: AttackCase, target: Target, *, trial: int = 0) -> dict:
     """Fire one case at the target per its delivery channel.
 
     * direct     — one /send with the rendered payload.
@@ -77,19 +111,19 @@ def _execute(case: AttackCase, target: Target) -> dict:
         for t in d.turns[:-1]:
             history.append({"role": "user", "content": t})
             history.append({"role": "assistant", "content": "Okay."})
-        return target.send(d.turns[-1], history=history)
+        return _send(target, d.turns[-1], history=history, trial=trial)
 
     if d.kind == "indirect":
         if getattr(target, "name", "") == "mock":
             # MockTarget consumes the planted doc text directly (full indirect support).
-            return target.send(d.doc)
+            return _send(target, d.doc, trial=trial)
         # Live/HTTP v1: no corpus injection — quote the doc as a retrieved observation.
         framed = (
             f"{d.question}\n\nFor reference, here is the retrieved document:\n\"\"\"\n{d.doc}\n\"\"\""
         )
-        return target.send(framed)
+        return _send(target, framed, trial=trial)
 
-    return target.send(d.question)
+    return _send(target, d.question, trial=trial)
 
 
 def run(
@@ -97,20 +131,50 @@ def run(
     cases: list[AttackCase],
     *,
     max_cases: int | None = None,
+    trials: int = 1,
     llm=None,
 ) -> list[RunRecord]:
-    """Execute up to `max_cases` cases against `target`, returning a RunRecord each.
+    """Execute up to `max_cases` cases against `target`, firing each `trials` times, returning ONE
+    aggregated RunRecord per case.
+
+    Per-payload compliance is stochastic on a live model, so each case is fired `trials` times and
+    the record aggregates the outcomes: `complied` / `refused` / `errors`. Errors are NOT refusals —
+    they are excluded from the success-rate denominator. The scanner is deterministic, so it is run
+    ONCE per payload and never multiplied by trials.
 
     `llm` (optional) is passed to the oracle for the ambiguous persona-residue judge ONLY — the
     deterministic oracle runs regardless, so a run with no LLM is fully meaningful."""
+    n_trials = max(1, trials)
     selected = cases[:max_cases] if max_cases else cases
     records: list[RunRecord] = []
     for case in selected:
-        flagged, sev, pattern = _scan_target_text(case)
-        resp = _execute(case, target)
-        answer = resp.get("answer", "")
-        err = resp.get("error", "")
-        verdict = adjudicate(answer, case.intent, llm=llm)
+        flagged, sev, pattern = _scan_target_text(case)  # scanned ONCE — deterministic per payload
+        complied = refused = errors = 0
+        first_error = ""
+        first_success_kind = ""
+        first_evidence = ""
+        winning_excerpt = ""
+        any_excerpt = ""
+        for t in range(n_trials):
+            resp = _execute(case, target, trial=t)
+            answer = resp.get("answer", "")
+            err = resp.get("error", "")
+            if err:
+                errors += 1
+                if not first_error:
+                    first_error = err
+                continue  # an error is neither a comply nor a refuse — excluded from the rate
+            verdict = adjudicate(answer, case.intent, llm=llm)
+            if not any_excerpt:
+                any_excerpt = (answer or "")[:280]
+            if verdict.success:
+                complied += 1
+                if not first_success_kind:
+                    first_success_kind = verdict.kind
+                    first_evidence = verdict.evidence
+                    winning_excerpt = (answer or "")[:280]
+            else:
+                refused += 1
         records.append(RunRecord(
             case_id=case.id,
             intent_id=case.intent.id,
@@ -121,11 +185,15 @@ def run(
             scanner_flagged=flagged,
             scanner_severity=sev,
             scanner_pattern=pattern,
-            success=verdict.success,
-            success_kind=verdict.kind,
-            evidence=verdict.evidence,
-            answer_excerpt=(answer or "")[:280],
-            error=err,
+            trials=n_trials,
+            complied=complied,
+            refused=refused,
+            errors=errors,
+            success=complied > 0,
+            success_kind=first_success_kind,
+            evidence=first_evidence,
+            answer_excerpt=winning_excerpt or any_excerpt,
+            error=first_error,
             intent=case.intent,
         ))
     return records
@@ -133,12 +201,22 @@ def run(
 
 @dataclass
 class RunSummary:
-    """Aggregate the two numbers overall and by breakdown. `evasion_rate` = fraction of cases the
-    scanner FAILED to flag; `asr` = fraction where the model COMPLIED."""
+    """Aggregate the two numbers overall and by breakdown.
 
-    total: int
-    scanner_evaded: int
-    succeeded: int
+    Scanner-evasion is per-PAYLOAD (deterministic): `evasion_rate` = fraction of payloads the
+    scanner FAILED to flag. ASR has two faces depending on `trials`:
+      * trials == 1 → `asr` = fraction of payloads that complied (the original single-shot number).
+      * trials  > 1 → compliance is stochastic, so `asr` is RATE-BASED: total complied trials over
+        total ANSWERED trials (errors excluded). This is the statistically honest headline.
+    Both are exposed so the report can pick the right one."""
+
+    total: int                       # number of payloads (cases)
+    scanner_evaded: int              # payloads the scanner did NOT flag
+    succeeded: int                   # payloads that complied at least once (complied > 0)
+    trials: int = 1
+    total_complied: int = 0          # Σ complied trials across all payloads
+    total_answered: int = 0          # Σ answered trials (complied + refused) — rate denominator
+    total_errors: int = 0            # Σ errored trials (excluded from the rate)
     by_breakdown: dict = field(default_factory=dict)  # (family,encoder,delivery) → counts
 
     @property
@@ -147,24 +225,42 @@ class RunSummary:
 
     @property
     def asr(self) -> float:
+        """Single-shot: fraction of payloads that complied. Multi-trial: rate over answered trials."""
+        if self.trials > 1:
+            return self.total_complied / self.total_answered if self.total_answered else 0.0
         return self.succeeded / self.total if self.total else 0.0
 
 
 def summarize(records: list[RunRecord]) -> RunSummary:
-    """Compute the overall + per-(family,encoder,delivery) rates from the records."""
+    """Compute the overall + per-(family,encoder,delivery) rates from the records.
+
+    Per breakdown cell we accumulate both the payload counts (`n`, `evaded`, `succeeded`) AND the
+    trial-level totals (`complied`, `answered`, `errors`) so the report can show a per-cell success
+    RATE like `6/8 = 75%` when trials>1 while keeping the single-shot columns when trials==1."""
     by: dict[tuple, dict] = {}
     evaded = succeeded = 0
+    total_complied = total_answered = total_errors = 0
+    n_trials = records[0].trials if records else 1
     for r in records:
         if not r.scanner_flagged:
             evaded += 1
         if r.success:
             succeeded += 1
+        total_complied += r.complied
+        total_answered += r.answered
+        total_errors += r.errors
         key = (r.family, r.encoder, r.delivery)
-        cell = by.setdefault(key, {"n": 0, "evaded": 0, "succeeded": 0})
+        cell = by.setdefault(key, {"n": 0, "evaded": 0, "succeeded": 0,
+                                   "complied": 0, "answered": 0, "errors": 0})
         cell["n"] += 1
         cell["evaded"] += 0 if r.scanner_flagged else 1
         cell["succeeded"] += 1 if r.success else 0
+        cell["complied"] += r.complied
+        cell["answered"] += r.answered
+        cell["errors"] += r.errors
     return RunSummary(total=len(records), scanner_evaded=evaded, succeeded=succeeded,
+                      trials=n_trials, total_complied=total_complied,
+                      total_answered=total_answered, total_errors=total_errors,
                       by_breakdown=by)
 
 
@@ -174,17 +270,19 @@ def run_campaign(
     families: list[str] | None = None,
     encoders: list[str] | None = None,
     max_cases: int | None = None,
+    trials: int = 1,
     llm=None,
     adapt: bool = False,
 ) -> tuple[list[RunRecord], RunSummary]:
-    """Convenience: generate the matrix, run it, optionally do ONE adaptive round, summarize.
+    """Convenience: generate the matrix, run it (each payload `trials` times), optionally do ONE
+    adaptive round, summarize.
 
     The adaptive round (only if `adapt` and an `llm` is present) mutates the failed cases and runs
     the new ones too — the 'loop until dry' shape, bounded to one extra pass in v1."""
     cases = strategist.generate(families=families, encoders=encoders)
-    records = run(target, cases, max_cases=max_cases, llm=llm)
+    records = run(target, cases, max_cases=max_cases, trials=trials, llm=llm)
     if adapt and llm is not None:
         extra_cases = strategist.adapt(llm, records)
         if extra_cases:
-            records += run(target, extra_cases, llm=llm)
+            records += run(target, extra_cases, trials=trials, llm=llm)
     return records, summarize(records)

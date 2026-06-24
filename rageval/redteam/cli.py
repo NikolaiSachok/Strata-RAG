@@ -41,6 +41,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help=f"Comma-separated encoders. Available: {', '.join(enc.ENCODERS)}.")
     p.add_argument("--max-cases", type=int, default=None,
                    help="Cap the number of cases fired (use a small bound for live runs).")
+    p.add_argument("--trials", type=int, default=1,
+                   help="Fire each payload N times and report a per-payload success RATE "
+                        "(compliance is stochastic on a live model). Errors are excluded from the "
+                        "rate denominator. Default 1 (single-shot).")
     p.add_argument("--report-path", default=None,
                    help="Write the markdown report here (also printed to stdout).")
     p.add_argument("--promote-path", default=None,
@@ -76,6 +80,7 @@ def main(argv: list[str] | None = None) -> int:
         families=_csv(args.families),
         encoders=_csv(args.encoders),
         max_cases=args.max_cases,
+        trials=args.trials,
         llm=llm,
         adapt=args.adapt,
     )
