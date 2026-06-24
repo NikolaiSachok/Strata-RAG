@@ -42,8 +42,11 @@ def render_report(records: list[RunRecord], summary: RunSummary | None = None) -
         lines.append(f"- **Payloads that complied at least once:** "
                      f"{_pct(s.succeeded, s.total)} ({s.succeeded}/{s.total})\n")
     else:
-        lines.append(f"- **End-to-end ASR:** {_pct(s.succeeded, s.total)} "
-                     f"({s.succeeded}/{s.total} where the model actually complied)\n")
+        excluded = s.total - s.payloads_answered
+        suffix = f"; {excluded} all-errored payload(s) excluded" if excluded else ""
+        lines.append(f"- **End-to-end ASR:** {_pct(s.succeeded, s.payloads_answered)} "
+                     f"({s.succeeded}/{s.payloads_answered} of payloads that answered complied"
+                     f"{suffix})\n")
 
     lines.append("## Breakdown by family × encoder × delivery\n")
     if multi:
@@ -137,12 +140,14 @@ def promote_to_fixtures(records: list[RunRecord]) -> str:
         intent = r.intent
         payload = getattr(intent, "text", r.rendered_payload)
         fid = f"rt_{r.intent_id}_{r.encoder}"
-        # Escape the payload for safe Python source embedding.
-        payload_src = payload.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+        # Use repr() to produce a VALID Python string literal: it escapes ALL control characters
+        # (\n, \r, \t, quotes, backslashes), so a payload containing e.g. a carriage return doesn't
+        # emit broken source. Hand-rolled escaping missed \r and friends.
+        payload_src = repr(payload)
         out.append(
-            f'    Attack("{fid}",\n'
-            f'           "{payload_src}",\n'
-            f'           "{pattern}", "{severity}"),'
+            f'    Attack({fid!r},\n'
+            f'           {payload_src},\n'
+            f'           {pattern!r}, {severity!r}),'
         )
     out.append("]")
     return "\n".join(out) + "\n"

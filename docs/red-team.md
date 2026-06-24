@@ -60,8 +60,10 @@ irreducible (**rules enforce, the LLM proposes** — the engine's standing princ
 - **Scenario builder** (`scenarios.py`) — multi-turn split sequences + indirect-doc templates (payload
   planted in fake retrieved content).
 - **Executor / Target** (`target.py`) — a `Target` protocol with `HttpChatTarget` (live `/chat`),
-  `InProcessTarget` (the agent in-process), and `MockTarget` (deterministic, for CI). Direct,
-  multi-turn, and indirect (corpus-injected) delivery.
+  `MockTarget` (deterministic, for CI), and `InProcessTarget` (the agent in-process — a **v1 stub**
+  that raises `NotImplementedError` with a TODO; the live path is covered by `HttpChatTarget`).
+  Direct, multi-turn, and indirect delivery (`MockTarget` reads the planted doc directly; a live
+  target can't inject a corpus doc in v1, so the doc is quoted in a framed user turn).
 - **Oracle** (`oracle.py`) — **deterministic canary detection first** (did `RT_CANARY_*`, an exfil
   URL, a system-prompt marker, or the forced persona string appear in the answer?), then an **LLM
   behavioral-hijack judge** only for the ambiguous residue.
@@ -71,12 +73,17 @@ irreducible (**rules enforce, the LLM proposes** — the engine's standing princ
 
 ## Attack taxonomy
 
-- **Families:** instruction-override · role/persona override · prompt-leak / exfil · output-format
-  hijack · data-exfil (markdown-image / URL) · tool-abuse · multi-turn split · indirect (poisoned
-  retrieval).
-- **Encoders:** plain · enclosed-alnum · full-width · homoglyph · zero-width-split · leetspeak ·
-  base64 · morse · ROT13 · acrostic/poem · translation(non-EN).
-- **Delivery:** direct user turn · multi-turn sequence · indirect via retrieved doc.
+The three axes are orthogonal — a case is one **family** × one **encoder** × one **delivery**.
+Note that *family* (the malicious GOAL) is distinct from *delivery* (the CHANNEL): multi-turn and
+indirect are **deliveries**, not families.
+
+- **Families** (the goal — `payloads.py::BASE_INTENTS`): instruction-override · role-persona-override
+  · prompt-leak-exfil · output-format-hijack · data-exfil (markdown-image / URL) · tool-abuse.
+- **Encoders** (the obfuscation — `encoders.py::ENCODERS`): plain · enclosed-alnum · full-width ·
+  homoglyph · zero-width-split · leetspeak · base64 · morse · ROT13 · acrostic/poem. *(translation
+  to a non-EN language is PLANNED, not yet shipped.)*
+- **Delivery** (the channel — `scenarios.py`): direct user turn · multi-turn split sequence ·
+  indirect via retrieved doc.
 
 ## Safety & open-core boundary
 
