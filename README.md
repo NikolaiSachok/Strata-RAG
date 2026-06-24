@@ -1,5 +1,7 @@
 # Strata-RAG — an eval-first, debuggable RAG engine over heterogeneous, multi-format document corpora
 
+**🌐 [Project site](https://nikolaisachok.github.io/Strata-RAG/) · 📖 [Wiki](https://github.com/NikolaiSachok/Strata-RAG/wiki) · [Architecture](https://github.com/NikolaiSachok/Strata-RAG/wiki/Architecture) · [Design-Decisions](https://github.com/NikolaiSachok/Strata-RAG/wiki/Design-Decisions) · [Evaluation](https://github.com/NikolaiSachok/Strata-RAG/wiki/Evaluation) · [Red-Teaming](https://github.com/NikolaiSachok/Strata-RAG/wiki/Red-Teaming)**
+
 A **heavily-commented, study-grade** Retrieval-Augmented Generation engine that indexes a
 **heterogeneous, multi-format document corpus** (a project archive of `.md` / `.txt` / `.docx`
 specs, descriptions, config, and promo copy) and answers questions over it — built to be
