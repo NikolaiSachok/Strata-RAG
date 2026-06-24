@@ -5,9 +5,10 @@ broken down by family × encoder × delivery, so you can SEE which obfuscation e
 whether any of it actually hijacked the model.
 
 NOTE on the ASR number: when computed from the DETERMINISTIC oracle alone (no LLM judge), the ASR is
-a CONSERVATIVE LOWER BOUND — the oracle is precision-first and parks any ambiguous "needle present
-but refusal language too" answer as not-success. The LLM behavioural judge recovers that recall on
-live runs (see `oracle.py`).
+a CONSERVATIVE LOWER BOUND. The oracle's deterministic SUCCESS path is lexicon-free and structural-only
+(bare-token answer; un-fenced standalone rendered exfil beacon) — so persona/prompt-leak compliance and
+any prose-form token/url hit are AMBIGUOUS and parked as not-success without an LLM. The LLM behavioural
+judge recovers that recall on live runs (see `oracle.py`).
 
 `promote_to_fixtures` closes the loop the issue is really about: a bypass the red-team DISCOVERS
 should become a permanent regression test. It emits ready-to-paste `Attack(...)` source for the
