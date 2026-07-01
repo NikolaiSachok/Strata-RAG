@@ -35,6 +35,19 @@ import codecs
 import unicodedata
 from collections.abc import Callable
 
+# The DEFENSE-side fold + confusable/zero-width tables live in the engine (rageval.normalize) so the
+# core scanner can use them without importing this adversarial package. We import them BACK here so
+# the red-team and the defense share ONE normalizer — the encoders below are the inverse of exactly
+# what `normalize()` folds. Re-exported for back-compat with anything importing them from here.
+from rageval.normalize import (  # noqa: F401 — re-exported for back-compat
+    _HOMOGLYPHS,
+    _HOMOGLYPHS_INV,
+    _ZERO_WIDTH,
+    homoglyph_unmap,
+    normalize,
+    strip_zero_width,
+)
+
 # ---------------------------------------------------------------------------
 # 1. enclosed_alnum — ASCII letters/digits → Unicode "circled" / enclosed forms.
 # ---------------------------------------------------------------------------
@@ -80,27 +93,8 @@ def fullwidth(text: str) -> str:
 # to the same Latin letter), so the inverse below is a *best-effort un-map* — exactly what a real
 # normalizer must do (there is no perfect inverse; you fold confusables toward a skeleton).
 
-_HOMOGLYPHS: dict[str, str] = {
-    "a": "а",  # Cyrillic a
-    "c": "с",  # Cyrillic es
-    "e": "е",  # Cyrillic ie
-    "i": "і",  # Cyrillic byelorussian-ukrainian i
-    "j": "ј",  # Cyrillic je
-    "o": "о",  # Cyrillic o
-    "p": "р",  # Cyrillic er
-    "s": "ѕ",  # Cyrillic dze
-    "x": "х",  # Cyrillic ha
-    "y": "у",  # Cyrillic u
-    "A": "Α",  # Greek Alpha
-    "B": "Β",  # Greek Beta
-    "E": "Ε",  # Greek Epsilon
-    "H": "Η",  # Greek Eta
-    "O": "Ο",  # Greek Omicron
-    "P": "Ρ",  # Greek Rho
-    "T": "Τ",  # Greek Tau
-    "X": "Χ",  # Greek Chi
-}
-_HOMOGLYPHS_INV = {v: k for k, v in _HOMOGLYPHS.items()}
+# The confusable table (_HOMOGLYPHS) + its inverse un-map (homoglyph_unmap) are imported from
+# rageval.normalize (top of file) so the attack encoder and the defense fold stay in lockstep.
 
 
 def homoglyph(text: str) -> str:
@@ -108,26 +102,16 @@ def homoglyph(text: str) -> str:
     return "".join(_HOMOGLYPHS.get(ch, ch) for ch in text)
 
 
-def homoglyph_unmap(text: str) -> str:
-    """Best-effort fold confusables back toward Latin (what a normalizer's skeleton step does)."""
-    return "".join(_HOMOGLYPHS_INV.get(ch, ch) for ch in text)
-
-
 # ---------------------------------------------------------------------------
 # 4. zero_width_split — insert invisible joiners between visible characters.
 # ---------------------------------------------------------------------------
 # "ignore" → "i​g​n​o​r​e": looks unbroken, but \bignore\b can't match
-# across the inserted U+200B/U+200D. Trivially reversible: strip the zero-width chars.
-
-_ZERO_WIDTH = "​‌‍﻿"  # ZWSP, ZWNJ, ZWJ, BOM/zero-width-no-break
+# across the inserted U+200B/U+200D. Trivially reversible: strip the zero-width chars
+# (strip_zero_width is imported from rageval.normalize — the defense owns the table).
 
 
 def zero_width_split(text: str, *, joiner: str = "​") -> str:
     return joiner.join(text)
-
-
-def strip_zero_width(text: str) -> str:
-    return "".join(ch for ch in text if ch not in _ZERO_WIDTH)
 
 
 # ---------------------------------------------------------------------------
@@ -295,16 +279,8 @@ LOSSY_DECODE: dict[str, Callable[[str], str]] = {
 }
 
 
-def normalize(text: str) -> str:
-    """The defense-side fold: chain the safe, lossless transforms a normalization pre-pass would
-    apply BEFORE re-scanning — NFKC (folds enclosed + full-width), strip zero-width, homoglyph
-    un-map. This is what the follow-up normalization defense will reuse; building it here keeps the
-    encoder/decoder symmetry honest. It does NOT attempt base64/morse/rot13/acrostic decode (those
-    require detecting the carrier first — a separate decode-and-rescan step)."""
-    folded = unicodedata.normalize("NFKC", text)
-    folded = strip_zero_width(folded)
-    folded = homoglyph_unmap(folded)
-    return folded
+# `normalize()` (the defense-side lossless fold) is imported from rageval.normalize at the top of
+# this file — the engine owns it; the red-team re-uses the SAME normalizer it's the inverse of.
 
 
 def decode(name: str, text: str) -> str:
