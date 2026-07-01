@@ -22,14 +22,20 @@ TWO OPERATIONS, DELIBERATELY SEPARATE:
     decode base64 / morse / rot13 blobs that hide an instruction, returning the decoded strings
     for the scanner to ALSO inspect. Carrier decode is a potential DoS vector (a giant blob, an
     explosion of candidate tokens), so it is hard-CAPPED on input size, segment count, and
-    segment length. See the caps below.
+    segment length. See the caps below. Base64 recovery covers the common REAL shapes —
+    un-fragmented, whitespace-/line-wrapped (MIME), and double-encoded carriers — but ARBITRARY
+    non-whitespace fragmentation (a blob split by punctuation) stays a DOCUMENTED RESIDUAL, like
+    acrostic/leet/morse-URL: recovering every possible split is undecidable and a DoS risk.
 
 WHY IT LIVES IN THE ENGINE (not in `redteam/`). `scan_for_injection` is core-engine and must not
 import from the adversarial `redteam` package (that would invert the dependency — the engine
 depending on its own attack tooling). So the canonical normalizer + the homoglyph/zero-width
 tables live HERE; `redteam/encoders.py` imports them from this module, so the red-team's
-adversarial encoders and the engine's defense share ONE normalizer. That symmetry is the point:
-the thing that folds an attack back is exactly the thing the encoders are the inverse of.
+adversarial encoders and the engine's defense share ONE normalizer + ONE confusable/zero-width
+table set. That symmetry is the point: the thing that folds an attack back is exactly the thing the
+encoders are the inverse of. (The morse table is the one deliberate exception — the defense-side
+`_MORSE_INV` below is intentionally narrowed to letters/digits, dropping the attack encoder's extra
+punctuation; a test guards that they still agree on the shared letter/digit subset.)
 
 Everything here is PURE and deterministic → same input, same output → unit-testable and the
 resulting scanner-evasion numbers are reproducible.
@@ -135,10 +141,17 @@ _MAX_DECODED = 4_000
 # Cap how many raw tokens of each carrier type we even ATTEMPT to decode (bounds the work itself,
 # not just the output) — e.g. a blob of tens of thousands of base64-looking words can't fan out.
 _MAX_CANDIDATE_TOKENS = 200
+# Bounded re-decode depth: a decoded segment that ITSELF looks like a base64 carrier is decoded once
+# more (attackers double-encode to hide from a single-pass decode). Capped so it can't recurse away.
+_MAX_B64_DEPTH = 2
 
-# base64 tokens: reasonably long runs of the base64 alphabet (short runs decode to noise and would
-# just add false candidates). Lower bound 16 chars ⇒ ~12 decoded bytes, above the _MIN_DECODED gate.
-_B64_TOKEN = re.compile(r"[A-Za-z0-9+/]{16,}={0,2}")
+# base64 REGIONS: a run of base64-alphabet chars that MAY contain interior whitespace/newlines —
+# real carriers are line-wrapped (MIME 76-col) or space-separated. We match the whole region incl.
+# interior spaces/newlines, then strip that whitespace before decoding. Region must contain enough
+# base64 chars to clear _MIN_DECODED after decode. (A single contiguous run is the common case; the
+# interior-whitespace class is what makes wrapped/split blobs recoverable.)
+_B64_REGION = re.compile(r"[A-Za-z0-9+/](?:[A-Za-z0-9+/\s]*[A-Za-z0-9+/])?={0,2}")
+_B64_WS = re.compile(r"\s+")
 # A morse "word": dots/dashes/spaces/slashes only, long enough to plausibly carry text.
 _MORSE_SPAN = re.compile(r"[.\-/ ]{8,}")
 
@@ -154,16 +167,38 @@ _MORSE_INV = {
 }
 
 
+def _try_b64_decode(token: str) -> str | None:
+    """Decode ONE whitespace-stripped base64 token to UTF-8, or None if it isn't valid b64/utf-8 or
+    falls outside the length band. `.isprintable()` drops binary garbage (a random blob usually
+    decodes to non-text)."""
+    if len(token) < 16:  # too short to carry a plausible instruction (~12 decoded bytes)
+        return None
+    try:
+        dec = base64.b64decode(token, validate=True).decode("utf-8")
+    except Exception:  # noqa: BLE001 — not valid b64/utf-8; skip this candidate
+        return None
+    if _MIN_DECODED <= len(dec) <= _MAX_DECODED and dec.isprintable():
+        return dec
+    return None
+
+
 def _decode_base64_segments(text: str) -> list[str]:
-    """Decode plausible base64 blobs to UTF-8, keeping only decodes that land in the length band."""
+    """Recover base64 carriers, robust to the COMMON real shapes: contiguous, line-wrapped (MIME),
+    and whitespace-separated blobs (interior whitespace is stripped before decode), plus BOUNDED
+    double-encoding (a decoded segment that itself looks like a carrier is decoded once more, up to
+    _MAX_B64_DEPTH). ARBITRARY non-whitespace fragmentation (e.g. a blob split by punctuation) is a
+    DOCUMENTED RESIDUAL — recovering every possible split is undecidable and a DoS risk."""
     out: list[str] = []
-    for tok in _B64_TOKEN.findall(text)[:_MAX_CANDIDATE_TOKENS]:
-        try:
-            dec = base64.b64decode(tok, validate=True).decode("utf-8")
-        except Exception:  # noqa: BLE001 — not valid b64/utf-8; skip this candidate
-            continue
-        if _MIN_DECODED <= len(dec) <= _MAX_DECODED and dec.isprintable():
+    for region in _B64_REGION.findall(text)[:_MAX_CANDIDATE_TOKENS]:
+        token = _B64_WS.sub("", region)  # rejoin line-wrapped / space-split base64
+        # Bounded chain: decode, and if the result is itself a base64 carrier, decode once more.
+        current = token
+        for _ in range(_MAX_B64_DEPTH):
+            dec = _try_b64_decode(current)
+            if dec is None:
+                break
             out.append(dec)
+            current = _B64_WS.sub("", dec)  # a nested carrier may itself be wrapped
     return out
 
 
