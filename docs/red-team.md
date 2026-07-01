@@ -151,6 +151,9 @@ Normalization is not a silver bullet; these stay evadable **by design**, and the
   (un-fragmented, whitespace-/line-wrapped MIME, **double-encoded** — those are all closed), but a blob
   split by *arbitrary non-whitespace* punctuation stays a residual: recovering every possible split is
   undecidable and a DoS risk.
+- **triple/deeper-nested base64** — the re-decode chain is bounded at `_MAX_B64_DEPTH = 2`, so
+  double-encoding is closed but depth ≥ 3 (triple base64 and deeper) evades. The cap is a deliberate
+  DoS bound; unbounded peeling of nested carriers is the thing we refuse to do.
 
 The headline arc holds: *a red-team that broke its own scanner, then closed the gap with numbers —
 and is honest about what it did not close.*
