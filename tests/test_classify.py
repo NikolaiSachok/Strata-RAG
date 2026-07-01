@@ -180,6 +180,27 @@ def test_published_contact_email_not_counted_as_pii_in_description():
     assert promo_entry.n_pii == 0  # support@ in a description is kept
 
 
+def test_sample_manifest_include_exclude_is_stable_after_phase4_decouple():
+    """Phase-4 REGRESSION bar (#37): after moving allow_ext + filename policy behind the sample
+    adapters' ClassificationPolicy, the sample corpus's include/exclude plan must be IDENTICAL —
+    the classifier now resolves the per-corpus policy, but the outcome for the sample is unchanged.
+    Pin the exact sets so a future decouple that shifts them fails loudly here."""
+    docs = discover_all(SAMPLE_CORPUS_DIR)
+    included, excluded = partition(docs, RULES)
+    inc_ids = {d.doc_id for d, _ in included}
+    # A representative slice of the byte-for-byte include set (per-corpus allow_ext = md/txt/docx +
+    # the sample adapters' declared php/html/htm; docs/*.txt content-vs-config; settings.md meta).
+    assert "atlas/atlas-vista/index.php" in inc_ids            # php allowed via adapter policy
+    assert "northwind/0001/ideas.txt" in inc_ids               # content-named docs/*.txt kept
+    assert "atlas/atlas-ledger/settings.md" in inc_ids         # metadata-only INCLUDED
+    exc_ids = {d.doc_id for d, _ in excluded}
+    assert "northwind/0001/setup.txt" in exc_ids               # config dump dropped
+    assert any("changelog" in d.doc_path.name.lower() for d, _ in excluded)
+    # The metadata-only flag survives the decouple.
+    meta = [dec for d, dec in included if d.doc_path.name == "settings.md"]
+    assert meta and all(dec.metadata_only for dec in meta)
+
+
 def test_manifest_surfaces_redaction_count():
     docs = discover_all(SAMPLE_CORPUS_DIR)
     manifest = build_manifest(docs, RULES, SETTINGS)

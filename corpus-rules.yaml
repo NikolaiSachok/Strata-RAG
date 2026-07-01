@@ -26,17 +26,16 @@ intent_note: >
   that describe the product). Drop template changelogs, agent-authored planning/build
   files, and engineering READMEs.
 
-# Allowed content extensions. Anything else a discovery adapter yields is excluded.
-# php/html/htm are allowed ONLY because the adapters' index.php/html PROMO FALLBACK yields
-# stripped, visible landing-page copy as a last-resort product source. Adapters never yield
-# arbitrary .php/.html files — only a project's index.* when it has no description doc.
+# Allowed content extensions — the GENERIC baseline every corpus shares. Anything else a
+# discovery adapter yields is excluded, UNLESS the corpus's adapter DECLARES the extension in its
+# ClassificationPolicy.allow_ext (#37): that per-corpus set is UNIONed with this baseline for that
+# corpus's docs only. e.g. the sample adapters add php/html/htm (their index.php/html PROMO
+# FALLBACK yields stripped landing-page copy) via sources/sample_policy.py — so php/html isn't a
+# corpus-specific constant baked into this shared ruleset.
 allow_ext:
   - md
   - txt
   - docx
-  - php
-  - html
-  - htm
 
 # Synthetic doc_types that are ALWAYS kept, regardless of extension / length / file rules.
 # These are adapter-emitted PROVENANCE records, not files on disk — e.g. a 'marker' doc for a

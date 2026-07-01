@@ -36,7 +36,7 @@ import yaml
 
 from .config import RULES_PATH, SETTINGS, Settings
 from .redact import PiiPolicy
-from .sources.base import SourceDoc
+from .sources.base import ClassificationPolicy, SourceDoc
 
 
 # ---------------------------------------------------------------------------
@@ -97,30 +97,83 @@ class Decision:
         return "INCLUDE" if self.include else "EXCLUDE"
 
 
-def classify(doc: SourceDoc, rules: CorpusRules) -> Decision:
+def _apply_file_rule(doc: SourceDoc, policy: ClassificationPolicy) -> tuple[str, str, bool] | None:
+    """(#37) Apply the adapter-declared FileRules to one doc. The core provides the MECHANISM
+    (drop / metadata-only / retype); the adapter supplied the POLICY (which filenames). Returns
+    (effective_doc_type, extra_reason, force_metadata_only) or None when no rule matched.
+
+    A 'drop' rule short-circuits to EXCLUDE; 'retype'/'metadata_only' just adjust the doc_type
+    (and the metadata_only flag) that the standard pipeline below then reasons over — so a
+    retyped doc still passes through corpus-rules.yaml (ext/min_chars/exclude_doc_types), keeping
+    the mechanism generic."""
+    name = doc.doc_path.name.lower()
+    for rule in policy.file_rules:
+        matched = (rule.name is not None and name == rule.name.lower()) or (
+            rule.glob is not None and fnmatch.fnmatch(name, rule.glob.lower()))
+        if not matched:
+            continue
+        reason = rule.reason or f"adapter file rule: {rule.action}"
+        if rule.action == "drop":
+            return ("__drop__", reason, False)
+        if rule.action == "metadata_only":
+            return (rule.doc_type or doc.doc_type, reason, True)
+        if rule.action == "retype":
+            return (rule.doc_type or doc.doc_type, reason, False)
+    return None
+
+
+def classify(doc: SourceDoc, rules: CorpusRules,
+             policy: ClassificationPolicy | None = None) -> Decision:
     """Apply Tier-1 rules to one document. FIRST matching rule wins (and is the reason).
 
-    Pure function (doc + rules in, Decision out) → trivially unit-testable, which is
-    exactly why the include/exclude logic is reliable enough to trust at ingest time.
+    Pure function (doc + rules [+ per-corpus policy] in, Decision out) → trivially unit-testable,
+    which is exactly why the include/exclude logic is reliable enough to trust at ingest time.
+
+    `policy` (#37) is the doc's adapter-declared ClassificationPolicy: its `allow_ext` is UNIONED
+    with the corpus-rules baseline for THIS doc (so one corpus adding a format never affects
+    another), and its `file_rules` can drop / mark metadata-only / retype the doc BEFORE the
+    standard pipeline runs. None → the generic default (corpus-rules.yaml alone).
     """
+    policy = policy or ClassificationPolicy()
     name = doc.doc_path.name.lower()
     parts = [p.lower() for p in doc.doc_path.parts]
+    doc_type = doc.doc_type
+    forced_metadata_only = False
+
+    # -1. Adapter-declared FILE RULES first (#37): a corpus supplies filename policy the core
+    #     applies via a generic mechanism (drop / metadata-only / retype). A drop wins outright;
+    #     a retype/metadata-only adjusts what the pipeline below reasons over.
+    fr = _apply_file_rule(doc, policy)
+    if fr is not None:
+        eff_type, fr_reason, force_meta = fr
+        if eff_type == "__drop__":
+            return Decision(False, fr_reason)
+        doc_type = eff_type
+        forced_metadata_only = force_meta
+
+    # The extension allow-list is the corpus-rules baseline UNIONed with this corpus's declared
+    # extensions (per-corpus, so adding a format for one corpus can't affect another).
+    allow_ext = rules.allow_ext | policy.allow_ext
 
     # 0. KEEP-list doc_types win first. Some adapters emit SYNTHETIC docs (e.g. provenance
     #    "marker" docs for non-conforming projects) that have no real file/extension and a
     #    short body. Those would be wrongly dropped by the ext/min_chars rules below, yet
     #    they ARE the signal (they make "which projects don't follow the structure?"
     #    answerable). A doc_type on the keep-list short-circuits to INCLUDE.
-    if doc.doc_type.lower() in rules.keep_doc_types:
-        return Decision(True, f"kept doc_type: {doc.doc_type}")
+    if doc_type.lower() in rules.keep_doc_types:
+        return Decision(True, f"kept doc_type: {doc_type}")
+
+    # 0a. An adapter file rule that forced metadata-only wins here too (INCLUDE-but-enrich-only).
+    if forced_metadata_only:
+        return Decision(True, fr_reason, metadata_only=True)
 
     # 0b. METADATA-ONLY doc_types (e.g. settings.md → 'metadata'). INCLUDED in the pipeline so
     #     it's consumed by enrich and never a blind spot, but flagged metadata_only so the
     #     indexer does NOT embed it (it's structured metadata, not narrative — embedding it
     #     dilutes top-k). Wins early so a metadata doc is never dropped by the ext/min_chars
     #     rules or mistaken for embeddable content.
-    if doc.doc_type.lower() in rules.metadata_only_doc_types:
-        return Decision(True, f"metadata-only doc_type: {doc.doc_type}", metadata_only=True)
+    if doc_type.lower() in rules.metadata_only_doc_types:
+        return Decision(True, f"metadata-only doc_type: {doc_type}", metadata_only=True)
 
     # 1. noise directory anywhere in the path. A rule matches a path component either
     #    exactly OR as a "family" prefix with a hyphen — so `back` also catches the
@@ -140,11 +193,11 @@ def classify(doc: SourceDoc, rules: CorpusRules) -> Decision:
             return Decision(False, f"noise filename glob: {pattern}")
 
     # 3. noise doc_type (assigned by the adapter)
-    if doc.doc_type.lower() in rules.exclude_doc_types:
-        return Decision(False, f"noise doc_type: {doc.doc_type}")
+    if doc_type.lower() in rules.exclude_doc_types:
+        return Decision(False, f"noise doc_type: {doc_type}")
 
-    # 4. extension not allowed
-    if doc.ext.lower() not in rules.allow_ext:
+    # 4. extension not allowed (per-corpus allow_ext = baseline ∪ this adapter's declared set)
+    if doc.ext.lower() not in allow_ext:
         return Decision(False, f"ext not allowed: .{doc.ext}")
 
     # 5. near-empty
@@ -154,12 +207,48 @@ def classify(doc: SourceDoc, rules: CorpusRules) -> Decision:
     return Decision(True, "ok")
 
 
+class PolicyResolver:
+    """Resolve (and cache) each doc's adapter-declared ClassificationPolicy by source_set (#37).
+
+    Corpus-agnostic: the resolver asks the registry for the adapter that owns a source_set and
+    reads its `classification_policy()`. A source_set with no registered adapter (or an adapter
+    that overrides nothing) resolves to the generic default — so classification NEVER depends on
+    an adapter being present. Cached per source_set (one lookup per family, not per doc)."""
+
+    def __init__(self):
+        self._cache: dict[str, ClassificationPolicy] = {}
+
+    def policy_for(self, source_set: str) -> ClassificationPolicy:
+        if source_set not in self._cache:
+            self._cache[source_set] = self._resolve(source_set)
+        return self._cache[source_set]
+
+    @staticmethod
+    def _resolve(source_set: str) -> ClassificationPolicy:
+        # Local import so classify.py stays importable even if sources isn't fully wired yet.
+        from .sources.registry import adapter_class_for_source_set
+
+        cls = adapter_class_for_source_set(source_set)
+        if cls is None:
+            return ClassificationPolicy()
+        try:
+            # classification_policy() is a pure declaration; a bare instance is enough to read it.
+            return cls(Path(".")).classification_policy()
+        except Exception:  # noqa: BLE001 — a broken policy never breaks classification
+            return ClassificationPolicy()
+
+
 def partition(docs: list[SourceDoc], rules: CorpusRules) -> tuple[list[tuple[SourceDoc, Decision]],
                                                                    list[tuple[SourceDoc, Decision]]]:
-    """Split candidates into (included, excluded), each paired with its Decision."""
+    """Split candidates into (included, excluded), each paired with its Decision.
+
+    Each doc is classified against its adapter's declared ClassificationPolicy (#37), resolved by
+    source_set and cached — so a corpus's per-corpus allow_ext / file rules apply to ITS docs
+    only, and a corpus that declares nothing still classifies via corpus-rules.yaml alone."""
+    resolver = PolicyResolver()
     included, excluded = [], []
     for d in docs:
-        dec = classify(d, rules)
+        dec = classify(d, rules, resolver.policy_for(d.source_set))
         (included if dec.include else excluded).append((d, dec))
     return included, excluded
 

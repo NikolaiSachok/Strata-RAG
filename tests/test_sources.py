@@ -11,12 +11,8 @@ import pytest
 
 from rageval.config import SAMPLE_CORPUS_DIR
 from rageval.sources import discover_all
-from rageval.sources.base import (
-    SourceAdapter,
-    SourceDoc,
-    docs_txt_doc_type,
-    is_store_listing_txt,
-)
+from rageval.sources.base import SourceAdapter, SourceDoc
+from rageval.sources.sample_policy import docs_txt_doc_type, is_store_listing_txt
 from rageval.sources.atlas import AtlasAdapter, strip_markup
 from rageval.sources.northwind import NorthwindAdapter
 
