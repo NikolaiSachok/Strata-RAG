@@ -1,20 +1,21 @@
-"""Tests for the DETERMINISTIC back/config.yaml metadata harvest (harvest.py).
+"""Tests for the structured-fact harvest (#36): the corpus-agnostic core primitive
+(rageval.facts) + the sample corpus's concrete harvester (sources/sample_facts).
 
-These lock down the two non-negotiables: (1) the CLEAN whitelisted fields are extracted and
-landing_url is derived, and (2) the SECRET blocks (third-party analytics/integration secrets,
-*_key/*_token) are NEVER extracted — proven against a sample config.yaml that deliberately
-contains fake secrets.
-Plus the bounded, FLAGGED contact-email derivation, and graceful behaviour when config.yaml is
-absent. All deterministic — no LLM, no network. Runs over the fictional data/sample/ corpus only.
+These lock down the two non-negotiables: (1) the CLEAN whitelisted fields are lifted as
+StructuredFacts and landing_url is DERIVED, and (2) the SECRET blocks (third-party
+analytics/integration secrets, *_key/*_token) are NEVER lifted — proven against a sample
+config.yaml that deliberately contains fake secrets. Plus the bounded, FLAGGED contact-email
+derivation, and graceful behaviour when the descriptor is absent. All deterministic — no LLM,
+no network. Runs over the fictional data/sample/ corpus only.
 """
 
 from __future__ import annotations
 
 from rageval.config import SAMPLE_CORPUS_DIR
-from rageval.harvest import (
-    ConfigHarvest,
+from rageval.facts import FieldWhitelistHarvester, StructuredFact, looks_secret
+from rageval.sources.sample_facts import (
     derive_contact_emails,
-    harvest_project,
+    harvest_facts,
     parse_config_yaml,
 )
 
@@ -33,7 +34,33 @@ integration:
 """
 
 
-# --- parse_config_yaml: clean whitelist in, secrets out ---------------------
+def _facts_dict(facts):
+    """Collapse a list of StructuredFacts → {field: value} for easy assertions."""
+    return {f.field: f.value for f in facts}
+
+
+# --- the CORE primitive: whitelist in, secrets out (corpus-neutral) ---------
+
+def test_core_harvester_lifts_only_whitelisted_fields():
+    h = FieldWhitelistHarvester({"name": "app_name", "domain": "domain"})
+    out = h.lift({"name": "Vista", "domain": "vista.test", "api_key": "SECRET", "other": "x"})
+    assert out == {"app_name": "Vista", "domain": "vista.test"}
+
+
+def test_core_harvester_refuses_secret_looking_whitelisted_key():
+    # Belt-and-braces: even if a secret-looking key were whitelisted, its value is refused.
+    h = FieldWhitelistHarvester({"api_key": "app_name"})
+    assert h.lift({"api_key": "leak"}) == {}
+    assert looks_secret("session_id") and not looks_secret("domain")
+
+
+def test_core_harvester_skips_non_scalar_empty_and_redacted():
+    h = FieldWhitelistHarvester({"name": "app_name", "blk": "b", "empty": "e", "red": "r"})
+    out = h.lift({"name": "Ok", "blk": {"x": 1}, "empty": "", "red": "[REDACTED_KEY]"})
+    assert out == {"app_name": "Ok"}
+
+
+# --- sample harvester: parse_config_yaml (clean whitelist in, secrets out) ---
 
 def test_parse_extracts_only_whitelisted_clean_fields():
     fields = parse_config_yaml(_SAMPLE_YAML)
@@ -50,10 +77,8 @@ def test_parse_never_extracts_secret_fields():
     """The CORE security assertion: no secret value or secret key ever appears in the harvest."""
     fields = parse_config_yaml(_SAMPLE_YAML)
     blob = repr(fields).lower()
-    # No secret VALUE leaked...
     assert "secret" not in blob
     assert "fake_token" not in blob and "fake_api_key" not in blob
-    # ...and no secret KEY became a harvested field.
     for forbidden in ("api_key", "token", "session_id", "analytics", "integration"):
         assert forbidden not in fields
 
@@ -71,17 +96,6 @@ def test_parse_skips_redacted_and_empty_values():
     assert fields["app_number"] == "9"
 
 
-# --- landing_url derivation -------------------------------------------------
-
-def test_landing_url_derived_from_domain():
-    h = ConfigHarvest(present=True, domain="vista-weather-7011.test")
-    assert h.landing_url == "https://vista-weather-7011.test"
-
-
-def test_landing_url_none_without_domain():
-    assert ConfigHarvest(present=True, domain=None).landing_url is None
-
-
 # --- contact email: derived + flagged, or unresolved ------------------------
 
 def test_contact_email_derived_from_simple_template():
@@ -91,46 +105,47 @@ def test_contact_email_derived_from_simple_template():
 
 
 def test_contact_email_unresolved_when_no_domain():
-    # No harvested domain → nothing to construct → honest empty (never fabricated).
     assert derive_contact_emails("support@<?= $domain ?>", None) == []
 
 
 def test_contact_email_unresolved_for_indirected_template():
-    # A template that does NOT place a literal local-part immediately before a domain echo is
-    # left UNRESOLVED rather than guessed.
     tmpl = "<?php echo build_support_address($config); ?>"
     assert derive_contact_emails(tmpl, "vista-weather-7011.test") == []
 
 
-# --- harvest_project over the real sample fixtures --------------------------
+# --- harvest_facts over the real sample fixtures ----------------------------
 
-def test_harvest_sample_vista_clean_fields_and_derived_email():
-    h = harvest_project(SAMPLE_CORPUS_DIR / "atlas" / "atlas-vista")
-    assert h.present is True
-    assert h.app_name == "Vista Weather"
-    assert h.domain == "vista-weather-7011.test"
-    assert h.landing_url == "https://vista-weather-7011.test"
-    assert h.app_number == "7011"
-    assert h.bundle_id == "test.example.vista"
-    assert h.localization == "EN"
-    # Contact email derived from back/contact.php AND flagged as derived.
-    assert h.contact_emails == ["support@vista-weather-7011.test"]
-    assert h.contact_emails_derived is True
+def test_harvest_sample_vista_yields_clean_facts_and_derived_email():
+    facts = list(harvest_facts("atlas-vista", SAMPLE_CORPUS_DIR / "atlas" / "atlas-vista"))
+    d = _facts_dict(facts)
+    assert d["app_name"] == "Vista Weather"
+    assert d["domain"] == "vista-weather-7011.test"
+    assert d["landing_url"] == "https://vista-weather-7011.test"
+    assert d["app_number"] == "7011"
+    assert d["bundle_id"] == "test.example.vista"
+    assert d["localization"] == "EN"
+    assert d["contact_emails"] == ["support@vista-weather-7011.test"]
+    # Provenance: descriptor fields are authoritative; landing_url + contact_emails are DERIVED.
+    prov = {f.field: f.provenance for f in facts}
+    assert prov["domain"] == "descriptor"
+    assert prov["landing_url"] == "derived"
+    assert prov["contact_emails"] == "derived"
+    # Every fact carries the entity id.
+    assert all(f.entity_id == "atlas-vista" for f in facts)
+    assert all(isinstance(f, StructuredFact) for f in facts)
 
 
 def test_harvest_sample_never_exposes_secrets():
     """End-to-end: harvesting the real fixture (which contains fake secret blocks) exposes
-    NO secret value anywhere in the resulting ConfigHarvest."""
-    h = harvest_project(SAMPLE_CORPUS_DIR / "atlas" / "atlas-vista")
-    blob = repr(h).lower()
+    NO secret value anywhere in the resulting facts."""
+    facts = list(harvest_facts("atlas-vista", SAMPLE_CORPUS_DIR / "atlas" / "atlas-vista"))
+    blob = repr(facts).lower()
     assert "fake_value_never_harvested" not in blob
     assert "analytics" not in blob and "integration" not in blob and "session_id" not in blob
 
 
 def test_harvest_absent_config_degrades_gracefully():
-    """A project directory with no back/config.yaml yields present=False and all-None fields —
-    proving the harvest never crashes or fabricates when config.yaml is missing (~5/232 projects)."""
-    h = harvest_project(SAMPLE_CORPUS_DIR / "atlas" / "atlas-orchard")
-    assert h.present is False
-    assert h.domain is None and h.landing_url is None and h.app_name is None
-    assert h.contact_emails is None
+    """A project directory with no back/config.yaml yields NO facts — proving the harvest never
+    crashes or fabricates when the descriptor is missing."""
+    facts = list(harvest_facts("atlas-orchard", SAMPLE_CORPUS_DIR / "atlas" / "atlas-orchard"))
+    assert facts == []

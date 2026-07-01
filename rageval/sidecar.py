@@ -63,11 +63,14 @@ class ProjectRecord:
     #                from a deterministic roster TSV join (roster.py), the authoritative ground
     #                truth. None when no roster row / no roster file.
     publisher: str | None = None
-    # STRUCTURED METADATA harvested DETERMINISTICALLY from back/config.yaml (harvest.py) — a
-    # field-WHITELIST (never secrets). These power metadata queries the vector index can't serve
-    # (e.g. "website URLs for fruit-themed apps?": theme from enrich + URL from here).
-    #   app_name       — see above (config.yaml app.name is its highest-confidence source).
-    #   domain         — app.domain (the homepage/website host); landing_url is derived from it.
+    # STRUCTURED METADATA columns filled by adapter-supplied StructuredFacts (#36) — the ADAPTER's
+    # harvester lifts them from a per-project descriptor under a field-WHITELIST (never secrets);
+    # the engine core knows no field names and just stores whatever facts an adapter emits into the
+    # matching column. These power metadata queries the vector index can't serve (e.g. "website
+    # URLs for fruit-themed apps?": theme from enrich + URL from here). The names below are the
+    # generic structured SLOTS this sidecar offers; a corpus fills the ones its descriptor exposes.
+    #   app_name       — see above (a descriptor name field is its highest-confidence source).
+    #   domain         — the homepage/website host; landing_url is derived from it.
     #   landing_url    — DERIVED: "https://" + domain.
     #   app_number     — app.number (store/build number).
     #   bundle_id      — app.bundle_id.

@@ -191,6 +191,31 @@ def get_adapters(corpus_root: Path) -> list[SourceAdapter]:
     return adapters
 
 
+def adapter_class_for_source_set(source_set: str) -> type[SourceAdapter] | None:
+    """Resolve the registered adapter CLASS that produces `source_set` (Phase-4 fact/policy hooks).
+
+    The registry keys adapters by their on-disk FOLDER, which usually equals `source_set`; but a
+    corpus may split one folder into several source-sets (e.g. a `foo` folder emitting `foo` and
+    `foo-variant`). So we match by the adapter's declared `source_set` first (exact), then fall
+    back to the base FAMILY (the part before the first '-', mirroring the roster join). Returns None
+    when no adapter is registered for it — the caller degrades gracefully (no structured facts).
+
+    This is what lets the corpus-agnostic pipeline (enrich.py) ask an adapter for its structured
+    facts WITHOUT the core knowing any adapter or field name."""
+    if not source_set:
+        return None
+    # Exact match on the adapter's declared source_set.
+    for cls in ADAPTER_BY_FOLDER.values():
+        if getattr(cls, "source_set", None) == source_set:
+            return cls
+    # Fall back to the base family (before the first '-'), matched against folder key or source_set.
+    family = source_set.split("-", 1)[0].lower()
+    for folder, cls in ADAPTER_BY_FOLDER.items():
+        if folder.lower() == family or str(getattr(cls, "source_set", "")).lower() == family:
+            return cls
+    return None
+
+
 def discover_all(corpus_root: Path) -> list[SourceDoc]:
     """Run every applicable adapter and collect all candidate SourceDocs.
 
