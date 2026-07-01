@@ -39,6 +39,12 @@ import re
 import secrets
 from dataclasses import dataclass, field
 
+# Engine-internal normalization (NFKC + zero-width strip + homoglyph un-map, plus a bounded
+# carrier decode). Imported under private aliases so the module-level `normalize` bool parameter of
+# scan_for_injection doesn't shadow the function name. Engine → engine: NO dependency on redteam.
+from .normalize import decode_and_rescan_segments as _decode_and_rescan_segments
+from .normalize import normalize as _normalize_text
+
 # Severity order shared with the rest of the engine's gating vocabulary.
 SEVERITY_ORDER = ["none", "minor", "major", "critical"]
 
@@ -111,13 +117,9 @@ _INJECTION_PATTERNS: list[tuple[str, str, re.Pattern]] = [
 ]
 
 
-def scan_for_injection(text: str, *, where: str = "") -> list[Finding]:
-    """Heuristically scan `text` for prompt-injection patterns → structured Findings.
-
-    Pure and deterministic: same input always yields the same findings, which is what
-    makes the adversarial test suite meaningful. `where` is stamped onto each finding so a
-    report can say *which chunk* an attack rode in on.
-    """
+def _scan_variant(text: str, where: str) -> list[Finding]:
+    """Run the literal-ASCII regexes over ONE string. Snippets/offsets index THIS string, so the
+    caller must only ever pair a variant's findings with the variant they were computed from."""
     findings: list[Finding] = []
     for pattern_id, severity, rx in _INJECTION_PATTERNS:
         for m in rx.finditer(text or ""):
@@ -126,6 +128,53 @@ def scan_for_injection(text: str, *, where: str = "") -> list[Finding]:
             findings.append(Finding(pattern=pattern_id, severity=severity,
                                     snippet=snippet[:160], where=where))
     return findings
+
+
+def scan_for_injection(text: str, *, where: str = "", normalize: bool = True) -> list[Finding]:
+    """Heuristically scan `text` for prompt-injection patterns → structured Findings.
+
+    Pure and deterministic: same input always yields the same findings, which is what
+    makes the adversarial test suite meaningful. `where` is stamped onto each finding so a
+    report can say *which chunk* an attack rode in on.
+
+    NORMALIZATION PRE-PASS (`normalize=True`, gated by config `guard_normalize`). The literal-ASCII
+    regexes are structurally blind to obfuscated triggers — zero-width-split, homoglyph, full-width,
+    enclosed-alnum, base64/morse/rot13 carriers. So when `normalize` is on we scan THREE views and
+    union the findings:
+      1. the ORIGINAL `text` (offsets/snippets are honest against it),
+      2. a NORMALIZED copy (NFKC + strip zero-width + homoglyph un-map) — catches confusable/format
+         obfuscation; findings here are stamped `+normalized` on `where` so a report shows WHY it
+         fired, and their snippets come from the normalized copy (NEVER indexed back into original —
+         a normalized match's offsets don't line up with the original string),
+      3. BOUNDED decoded carrier segments (base64/morse/rot13), each normalized then scanned;
+         stamped `+decoded`.
+    We DEDUP on `(pattern, snippet)` — coarser than that (e.g. `(pattern, severity)`) would collapse
+    genuinely distinct hits; the snippet distinguishes them while still merging the same hit seen on
+    two views. The ORIGINAL `text` is always preserved for the answer/citations — normalization is
+    scan-only.
+
+    `normalize=False` restores the pure original-only behaviour (used to MEASURE the layer's effect,
+    and set by the caller from `guard_normalize`)."""
+    findings: list[Finding] = _scan_variant(text, where)
+    if normalize:
+        norm = _normalize_text(text or "")
+        if norm != (text or ""):
+            findings += _scan_variant(norm, f"{where}+normalized" if where else "normalized")
+        for seg in _decode_and_rescan_segments(text or ""):
+            # Decoded carriers are re-normalized before scanning (a decoded blob can itself be
+            # obfuscated). Snippets index the decoded segment, stamped so the report is explicit.
+            seg_norm = _normalize_text(seg)
+            findings += _scan_variant(seg_norm, f"{where}+decoded" if where else "decoded")
+
+    # Union + dedup on (pattern, snippet): merge the same hit seen across views, keep distinct hits.
+    deduped: list[Finding] = []
+    seen: set[tuple[str, str]] = set()
+    for f in findings:
+        key = (f.pattern, f.snippet)
+        if key not in seen:
+            seen.add(key)
+            deduped.append(f)
+    return deduped
 
 
 def max_severity(findings: list[Finding]) -> str:

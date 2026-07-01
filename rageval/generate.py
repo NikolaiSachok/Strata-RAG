@@ -163,6 +163,7 @@ class RagPipeline:
         s = self.settings
         report = g.GuardrailReport(layers={
             "input_scan": s.guard_input_scan,
+            "normalize": s.guard_normalize,
             "spotlight": s.guard_spotlight,
             "output_validate": s.guard_output_validate,
             "quarantine": s.guard_quarantine,
@@ -181,7 +182,8 @@ class RagPipeline:
         if s.guard_input_scan:
             for c in chunks:
                 cid = f"{c.source_set}/{c.project_id}/{c.source}::{c.chunk_index}"
-                findings = g.scan_for_injection(c.text, where=f"chunk:{cid}")
+                findings = g.scan_for_injection(c.text, where=f"chunk:{cid}",
+                                                normalize=s.guard_normalize)
                 if s.guard_llm_classifier:
                     findings += g.llm_injection_scan(c.text, self.llm, where=f"chunk:{cid}")
                 report.input_findings.extend(findings)
