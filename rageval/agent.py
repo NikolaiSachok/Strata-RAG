@@ -365,14 +365,16 @@ def _run_metadata_tool(args: dict) -> tuple[str, aggregate.AggregateResult | Non
     return obs, result, None
 
 
-def _scan_tool_input(text: str, *, where: str, report: g.GuardrailReport) -> None:
+def _scan_tool_input(text: str, *, where: str, report: g.GuardrailReport,
+                     normalize: bool = True) -> None:
     """Injection-scan an UNTRUSTED tool input (the user's query, a filter value) before it is
     executed, and record findings on the conversation report. This guards the INPUT side of
     every hop — a malicious follow-up question is flagged here even if it never reaches a
-    retrieved chunk."""
+    retrieved chunk. `normalize` (from guard_normalize) runs the normalization pre-pass so an
+    obfuscated tool input is caught too."""
     if not text:
         return
-    findings = g.scan_for_injection(text, where=where)
+    findings = g.scan_for_injection(text, where=where, normalize=normalize)
     if findings:
         report.input_findings.extend(findings)
 
@@ -467,12 +469,17 @@ class ChatAgent:
         compose a grounded answer or an honest no-info fallback."""
         turns = _coerce_history(history)
 
+        # The normalization pre-pass is config-gated (guard_normalize); read it once so every
+        # untrusted-text scan this turn uses the same setting and the report reflects it.
+        guard_normalize = getattr(getattr(self.pipeline, "settings", None), "guard_normalize", True)
+
         # Seed the conversation report with the layers the agent UNCONDITIONALLY runs every turn
         # (input scan on untrusted inputs, output validate on the final answer, and — since we now
         # spotlight observations — spotlight). Semantic hops UNION in their own per-hop layers.
         # Without this seed an aggregation-only turn would report layers={} and look unguarded.
         report = g.GuardrailReport(layers={
             "input_scan": True,
+            "normalize": guard_normalize,
             "spotlight": True,
             "output_validate": True,
         })
@@ -484,7 +491,8 @@ class ChatAgent:
 
         # INPUT GUARD: scan the user's question itself (an injection can ride in via the prompt,
         # not only via retrieved chunks).
-        _scan_tool_input(question, where="user_question", report=report)
+        _scan_tool_input(question, where="user_question", report=report,
+                         normalize=guard_normalize)
 
         trajectory: list[ToolCall] = []
         scratch: list[str] = []           # the ReAct scratchpad (observations this turn)
@@ -631,11 +639,17 @@ class ChatAgent:
         except Exception:  # noqa: BLE001 — a flaky backend must not crash the turn
             return ""
 
+    @property
+    def _guard_normalize(self) -> bool:
+        """The config gate for the normalization pre-pass (defaults True if settings absent)."""
+        return getattr(getattr(self.pipeline, "settings", None), "guard_normalize", True)
+
     def _scan_observation(self, obs: str, tool: str, report: g.GuardrailReport) -> None:
         """SEC-H1: injection-scan a tool OBSERVATION before it re-enters the model's context.
         Corpus free-text rendered by query_metadata's lookup/SELECT * (or a semantic chunk that
         slipped the per-hop scan) is untrusted; findings merge into the conversation report."""
-        findings = g.scan_for_injection(obs, where=f"tool_observation:{tool}")
+        findings = g.scan_for_injection(obs, where=f"tool_observation:{tool}",
+                                        normalize=self._guard_normalize)
         if findings:
             report.input_findings.extend(findings)
 
@@ -647,7 +661,8 @@ class ChatAgent:
             query = str(args.get("query", "")).strip()
             if not query:
                 return "semantic_search needs a 'query' string.", False
-            _scan_tool_input(query, where="tool_input:semantic_search", report=report)
+            _scan_tool_input(query, where="tool_input:semantic_search", report=report,
+                             normalize=self._guard_normalize)
             # #6 CITATION INTEGRITY: renumber this hop's [n] into the GLOBAL index BEFORE we
             # extend all_chunks, so the offset is the count of chunks already accumulated.
             base = len(all_chunks)
@@ -667,7 +682,8 @@ class ChatAgent:
         if isinstance(filt, dict):
             for v in filt.values():
                 if isinstance(v, str):
-                    _scan_tool_input(v, where="tool_input:query_metadata.filter", report=report)
+                    _scan_tool_input(v, where="tool_input:query_metadata.filter", report=report,
+                                     normalize=self._guard_normalize)
         obs, _result, err = _run_metadata_tool(args)
         # PII (MEDIUM-1). The chunk path is PII-redacted at INGEST, but the sidecar holds raw
         # structured fields: `contact_emails` is an ALLOWED_FIELD rendered VERBATIM by lookup /

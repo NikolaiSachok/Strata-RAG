@@ -108,11 +108,17 @@ def _delivered(case: AttackCase, target: Target) -> tuple[str, list[dict]]:
     return d.question, []
 
 
-def _scan_target_text(case: AttackCase, target: Target) -> tuple[bool, str, str]:
+def _scan_target_text(case: AttackCase, target: Target, *,
+                      normalize: bool = True) -> tuple[bool, str, str]:
     """Run the deterministic scanner over the EXACT text `_execute` will send (computed once via
-    `_delivered`). Returns (flagged, severity, pattern)."""
+    `_delivered`). Returns (flagged, severity, pattern).
+
+    `normalize` mirrors the engine's `guard_normalize`: run it False to measure the PRE-#31 blind
+    scanner (the BEFORE evasion rate), True for the WITH-normalization scanner (the AFTER rate).
+    Defaults to the target's own `normalize` setting when present so a `MockTarget(normalize=...)`
+    and the evasion metric stay consistent."""
     question, _history = _delivered(case, target)
-    findings = scan_for_injection(question)
+    findings = scan_for_injection(question, normalize=normalize)
     sev = max_severity(findings)
     flagged = sev != "none"
     pattern = findings[0].pattern if findings else ""
@@ -143,6 +149,7 @@ def run(
     max_cases: int | None = None,
     trials: int = 1,
     llm=None,
+    normalize: bool | None = None,
 ) -> list[RunRecord]:
     """Execute up to `max_cases` cases against `target`, firing each `trials` times, returning ONE
     aggregated RunRecord per case.
@@ -156,9 +163,15 @@ def run(
     deterministic oracle runs regardless, so a run with no LLM is fully meaningful."""
     n_trials = max(1, trials)
     selected = cases[:max_cases] if max_cases else cases
+    # The evasion metric uses the SAME normalization setting as the target, so the reported
+    # scanner-evasion rate matches the scanner the target actually ran. `normalize=None` (the
+    # default) inherits the target's own `normalize` flag (MockTarget), falling back to True (the
+    # shipped guard_normalize default) for targets that don't carry the flag (http/flaky).
+    do_normalize = getattr(target, "normalize", True) if normalize is None else normalize
     records: list[RunRecord] = []
     for case in selected:
-        flagged, sev, pattern = _scan_target_text(case, target)  # scanned ONCE — deterministic per payload
+        # scanned ONCE — deterministic per payload
+        flagged, sev, pattern = _scan_target_text(case, target, normalize=do_normalize)
         complied = refused = errors = 0
         first_error = ""
         first_success_kind = ""
@@ -291,6 +304,7 @@ def run_campaign(
     trials: int = 1,
     llm=None,
     adapt: bool = False,
+    normalize: bool | None = None,
 ) -> tuple[list[RunRecord], RunSummary]:
     """Convenience: generate the matrix, run it (each payload `trials` times), optionally do ONE
     adaptive round, summarize.
@@ -298,9 +312,9 @@ def run_campaign(
     The adaptive round (only if `adapt` and an `llm` is present) mutates the failed cases and runs
     the new ones too — the 'loop until dry' shape, bounded to one extra pass in v1."""
     cases = strategist.generate(families=families, encoders=encoders)
-    records = run(target, cases, max_cases=max_cases, trials=trials, llm=llm)
+    records = run(target, cases, max_cases=max_cases, trials=trials, llm=llm, normalize=normalize)
     if adapt and llm is not None:
         extra_cases = strategist.adapt(llm, records)
         if extra_cases:
-            records += run(target, extra_cases, trials=trials, llm=llm)
+            records += run(target, extra_cases, trials=trials, llm=llm, normalize=normalize)
     return records, summarize(records)

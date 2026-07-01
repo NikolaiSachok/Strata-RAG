@@ -232,6 +232,7 @@ class Settings:
     # teaching artifact — you can measure each layer's individual contribution to the
     # injection-attack-success-rate. All default ON.
     guard_input_scan: bool     # scan retrieved chunks for injection patterns BEFORE generation
+    guard_normalize: bool      # normalization pre-pass (NFKC/zero-width/homoglyph/decode) before scanning
     guard_spotlight: bool      # wrap passages in random sentinels + treat them as inert DATA
     guard_output_validate: bool  # validate the answer AFTER generation (exfil/fake-cite/leak)
     guard_quarantine: bool     # DROP (don't just flag) chunks with a high-severity injection hit
@@ -306,6 +307,7 @@ class Settings:
             chunk_size=_env_int("RAGEVAL_CHUNK_SIZE", 800),
             chunk_overlap=_env_int("RAGEVAL_CHUNK_OVERLAP", 150),
             guard_input_scan=_flag("RAGEVAL_GUARD_INPUT_SCAN", True),
+            guard_normalize=_flag("RAGEVAL_GUARD_NORMALIZE", True),
             guard_spotlight=_flag("RAGEVAL_GUARD_SPOTLIGHT", True),
             guard_output_validate=_flag("RAGEVAL_GUARD_OUTPUT_VALIDATE", True),
             guard_quarantine=_flag("RAGEVAL_GUARD_QUARANTINE", True),

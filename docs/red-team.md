@@ -114,13 +114,46 @@ indirect are **deliveries**, not families.
   `MockTarget` ASR). The full adaptive run against a live model is opt-in (`python -m rageval.redteam`)
   / scheduled.
 
-## What v1 delivers vs. what it motivates
+## What v1 delivered, and the defense it drove (#31, SHIPPED)
 
-**v1 (this branch):** the package + tests green on `MockTarget` + a documented live run producing an
-ASR/evasion table. The adaptive Strategist may be a catalog-mutating stub.
+**v1:** the package + tests green on `MockTarget` + a documented live run producing an ASR/evasion
+table. The adaptive Strategist may be a catalog-mutating stub.
 
-**The follow-up it justifies (separate issue):** a **normalization pre-pass** before
-`scan_for_injection` — NFKC fold, homoglyph map, strip zero-width, decode-and-rescan (morse/base64/
-ROT13) — then re-run the red-team and show the **evasion rate drop measurably**. That before/after is
-the headline result: *I built a red-team that broke my own scanner, then closed the gap with numbers
-to prove it.*
+**The defense it drove — SHIPPED in #31:** a **normalization pre-pass** in `scan_for_injection`
+(engine module `rageval/normalize.py`) — NFKC fold, homoglyph un-map, strip zero-width, plus a
+**bounded** decode-and-rescan for base64 / morse / ROT13 carriers. It is gated by `guard_normalize`
+(default on, `RAGEVAL_GUARD_NORMALIZE`) so the layer stays measurable — toggle it and watch the
+number move. The scanner inspects a **normalized copy** (and decoded carrier segments) while the
+ORIGINAL text is preserved for the answer/citations.
+
+### Before / after (the headline result)
+
+Re-running the red-team against `MockTarget` with the pre-pass off (`--no-normalize`) vs on:
+
+- **Scanner-evasion: 93% → 17%** (78/84 → 14/84 payloads the deterministic scanner missed).
+- **End-to-end ASR: 58% → 8%** (49/84 → 7/84). *(On `MockTarget` the model refuses iff the scanner
+  flags, so ASR is ceilinged by evasion — the two still diverge because the conservative
+  deterministic oracle parks persona / prompt-leak / prose-token complies as ambiguous.)*
+
+The six fold/decode-recoverable encoders — enclosed-alnum, full-width, homoglyph, zero-width-split,
+base64, ROT13 — drop from **100% → 0%** evasion.
+
+### Documented residuals (honest scope)
+
+Normalization is not a silver bullet; these stay evadable **by design**, and the docstrings/tests say so:
+
+- **acrostic / steganographic** — the payload is carrier *text* (line initials), not a reversible
+  transform; a lossless fold can't recover it.
+- **leetspeak** — lossy digit↔letter substitution (`1` is ambiguous); left out rather than guessed.
+- **morse-URL** — morse is uppercase-only and drops URL punctuation (`:`, `/`), so a decoded
+  exfil/tool payload no longer carries the `http://` a URL rule needs (letter-only triggers still fold).
+- **arbitrary-delimiter base64 fragmentation** — base64 recovery now handles the common REAL shapes
+  (un-fragmented, whitespace-/line-wrapped MIME, **double-encoded** — those are all closed), but a blob
+  split by *arbitrary non-whitespace* punctuation stays a residual: recovering every possible split is
+  undecidable and a DoS risk.
+- **triple/deeper-nested base64** — the re-decode chain is bounded at `_MAX_B64_DEPTH = 2`, so
+  double-encoding is closed but depth ≥ 3 (triple base64 and deeper) evades. The cap is a deliberate
+  DoS bound; unbounded peeling of nested carriers is the thing we refuse to do.
+
+The headline arc holds: *a red-team that broke its own scanner, then closed the gap with numbers —
+and is honest about what it did not close.*

@@ -360,7 +360,8 @@ class Judge:
         # was already scanned at generation/agent time; the tool-observation block is the new hole).
         scan_findings = [
             f for i, obs in enumerate(answer.tool_observations, start=1)
-            for f in g.scan_for_injection(obs, where=f"judge_context:tool_observation:{i}")
+            for f in g.scan_for_injection(obs, where=f"judge_context:tool_observation:{i}",
+                                          normalize=self.settings.guard_normalize)
         ]
         framing = g.data_framing_instruction(sentinel)
         prompt = (
