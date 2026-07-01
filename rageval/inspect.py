@@ -71,12 +71,12 @@ def coverage_report() -> str:
     thin = [r for r in recs if r.metadata_confidence == "low"]
     lines.append(f"  THIN metadata (low enrich confidence): {len(thin)}")
     for r in sorted(thin, key=lambda x: x.key):
-        lines.append(f"      ~~  {r.key}  (app_name={r.app_name!r} category={r.app_category!r})")
-    # NO config.yaml flag (observability for the deterministic harvest): a project that yielded
-    # content docs but no back/config.yaml (domain/landing_url unharvested). On the real corpus
-    # this is the small fraction of projects without a config.yaml — a reviewer can see which.
-    no_cfg = [r for r in recs if r.domain is None and r.chunk_count > 0]
-    lines.append(f"  NO config.yaml domain (harvest gap): {len(no_cfg)}")
+        lines.append(f"      ~~  {r.key}  (app_name={r.fact('app_name')!r} category={r.app_category!r})")
+    # NO descriptor-domain flag (observability for the structured harvest): a project that yielded
+    # content docs but no harvested `domain` facet. On the real corpus this is the small fraction of
+    # projects without a descriptor — a reviewer can see which. (Facet name resolved generically.)
+    no_cfg = [r for r in recs if r.fact("domain") is None and r.chunk_count > 0]
+    lines.append(f"  NO descriptor domain (harvest gap): {len(no_cfg)}")
     for r in sorted(no_cfg, key=lambda x: x.key):
         lines.append(f"      cfg?  {r.key}")
     return "\n".join(lines)
@@ -91,16 +91,19 @@ def sidecar_dump() -> str:
         lines.append("  (empty — run `python -m rageval.ingest` first)")
     for r in recs:
         humor = "?" if r.has_humor is None else ("yes" if r.has_humor else "no")
-        email = "?" if r.contact_emails_derived is None else (
-            f"{r.contact_emails} (derived)" if r.contact_emails_derived else r.contact_emails)
+        # Adapter FACTS printed generically (schema-agnostic): whatever the corpus declared/emitted,
+        # with provenance. No app-specific field name is hardcoded here.
+        facts_str = ", ".join(
+            f"{k}={r.facts[k]!r}"
+            + (f"[{r.facts_provenance.get(k)}]" if r.facts_provenance.get(k) else "")
+            for k in sorted(r.facts)
+        ) or "(none)"
         lines.append(
             f"  {r.key}\n"
-            f"      app_name={r.app_name!r} publisher={r.publisher!r} "
-            f"category={r.app_category!r} humor={humor} chunks={r.chunk_count}\n"
+            f"      publisher={r.publisher!r} category={r.app_category!r} "
+            f"humor={humor} chunks={r.chunk_count}\n"
             f"      theme_tags={r.theme_tags} doc_types={r.doc_types}\n"
-            f"      domain={r.domain!r} landing_url={r.landing_url!r}\n"
-            f"      app_number={r.app_number!r} bundle_id={r.bundle_id!r} "
-            f"localization={r.localization!r} contact_emails={email}\n"
+            f"      facts: {facts_str}\n"
             f"      summary={r.one_line_summary!r}"
         )
     # An example audit query, to teach the SQL-aggregation angle. publisher is the

@@ -29,35 +29,59 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from .config import SIDECAR_PATH
-from .sidecar import ProjectRecord
+from .sidecar import create_query_view
 
 # ---------------------------------------------------------------------------
 # The trust boundary: what the LLM is allowed to name.
 # ---------------------------------------------------------------------------
 
-# The column WHITELIST is DERIVED from the sidecar's ProjectRecord (single source of truth):
-# if a field exists on the record, it is a real column and may be named by the LLM; anything
-# else is rejected. `key` is the synthesized primary key (project_id within source_set), also a
-# real column. Deriving this (vs hard-coding) means a schema change in sidecar.py automatically
-# updates the boundary — the guard can never drift out of sync with the table.
-ALLOWED_FIELDS: frozenset[str] = frozenset(
-    [f.name for f in fields(ProjectRecord)] + ["key"]
-)
+# The GENERIC engine-owned columns on `projects` (structural + enrichment + provenance), plus the
+# synthesized primary `key`. NO corpus-specific structured-fact name lives here.
+_GENERIC_FIELDS: frozenset[str] = frozenset({
+    "key", "project_id", "source_set", "app_category", "theme_tags", "has_humor",
+    "doc_types", "one_line_summary", "chunk_count", "kotlin_source_id", "status",
+    "non_conforming", "metadata_confidence", "publisher",
+})
+
+# Generic JSON-array columns (stored as TEXT holding a JSON list). Equality filters and DISTINCT
+# over these are imperfect (they match the serialized blob), so we only allow them where it's
+# honest. Adapter facets of declared type text[] are added dynamically in _json_array_fields().
+_GENERIC_JSON_ARRAY_FIELDS: frozenset[str] = frozenset({"theme_tags", "doc_types"})
+
+
+def _declared_facets() -> dict[str, str]:
+    """{facet_name: facet_type} across all registered adapters (queryable allowlist). Resolved at
+    CALL time so a corpus registered after import (a plugin) is honoured."""
+    from .sources.registry import all_declared_facets
+
+    return all_declared_facets()
+
+
+def allowed_fields() -> frozenset[str]:
+    """The QUERYABLE field allowlist: the generic `projects` columns UNIONed with every
+    adapter-DECLARED facet name (#36). Derived from adapter declarations — NOT a dataclass — so a
+    corpus's own facets are queryable with no core edit, and an undeclared field is rejected
+    (fail-closed)."""
+    return _GENERIC_FIELDS | frozenset(_declared_facets())
+
+
+def _json_array_fields() -> frozenset[str]:
+    """Generic JSON-array columns + any declared facet of type text[]."""
+    return _GENERIC_JSON_ARRAY_FIELDS | frozenset(
+        n for n, t in _declared_facets().items() if t == "text[]")
+
+
+# Back-compat module constant (a SNAPSHOT at import). The executor validates against the live
+# allowed_fields() so a plugin-registered facet is accepted even if it registered after import.
+ALLOWED_FIELDS: frozenset[str] = allowed_fields()
 
 # The intents this executor supports. Each maps to ONE parameterized template below.
 ALLOWED_INTENTS: frozenset[str] = frozenset(
     {"count", "list", "group_by_count", "top_n", "lookup"}
-)
-
-# JSON-array columns (stored as TEXT holding a JSON list). Equality filters and DISTINCT over
-# these are imperfect (they match the serialized blob), so we only allow them where it's honest:
-# count/list of the raw column. We note this rather than silently doing the wrong thing.
-_JSON_ARRAY_FIELDS: frozenset[str] = frozenset(
-    {"theme_tags", "doc_types", "contact_emails"}
 )
 
 # A conservative hard cap so a templated query can never scan/emit unbounded rows.
@@ -120,14 +144,17 @@ class AggregateResult:
 # ---------------------------------------------------------------------------
 
 def _validate_field(name: str | None, *, what: str) -> str:
-    """Confirm a slot names a REAL sidecar column. Rejects anything off the whitelist.
+    """Confirm a slot names a queryable field: a generic `projects` column OR an adapter-DECLARED
+    facet. Rejects anything off the live allowlist (resolved at call time so a plugin-registered
+    facet is accepted).
 
-    This is the core of the trust boundary: an LLM-proposed field that isn't an actual
-    column can NEVER reach a query — it's refused here first."""
-    if not name or name not in ALLOWED_FIELDS:
+    This is the core of the trust boundary: an LLM-proposed field that isn't a real column/facet
+    can NEVER reach a query — it's refused here first."""
+    allowed = allowed_fields()
+    if not name or name not in allowed:
         raise AggregateError(
             f"{what} '{name}' is not a known sidecar field "
-            f"(allowed: {', '.join(sorted(ALLOWED_FIELDS))})."
+            f"(allowed: {', '.join(sorted(allowed))})."
         )
     return name
 
@@ -228,7 +255,7 @@ def execute(
 
     if intent == "count":
         where, params = _where_clause(filt)
-        sql = f"SELECT COUNT(*) AS count FROM projects{where} LIMIT ?"
+        sql = f"SELECT COUNT(*) AS count FROM projects_q{where} LIMIT ?"
         params = params + [lim]
         rows = _run(sidecar_path, sql, params)
         return AggregateResult("count", rows, sql, params, row_count=len(rows))
@@ -237,7 +264,7 @@ def execute(
         col = _validate_field(field, what="list field")
         where, params = _where_clause(filt)
         # DISTINCT values of one column (the common "list all brands / categories" question).
-        sql = f"SELECT DISTINCT {col} AS {col} FROM projects{where} ORDER BY {col} LIMIT ?"
+        sql = f"SELECT DISTINCT {col} AS {col} FROM projects_q{where} ORDER BY {col} LIMIT ?"
         params = params + [lim]
         rows = _run(sidecar_path, sql, params)
         return AggregateResult("list", rows, sql, params, row_count=len(rows))
@@ -246,7 +273,7 @@ def execute(
         col = _validate_field(field, what="group-by field")
         where, params = _where_clause(filt)
         sql = (
-            f"SELECT {col} AS {col}, COUNT(*) AS count FROM projects{where} "
+            f"SELECT {col} AS {col}, COUNT(*) AS count FROM projects_q{where} "
             f"GROUP BY {col} ORDER BY count DESC, {col} LIMIT ?"
         )
         params = params + [lim]
@@ -258,7 +285,7 @@ def execute(
         col = _validate_field(field, what="top-n field")
         where, params = _where_clause(filt)
         sql = (
-            f"SELECT {col} AS {col}, COUNT(*) AS count FROM projects{where} "
+            f"SELECT {col} AS {col}, COUNT(*) AS count FROM projects_q{where} "
             f"GROUP BY {col} ORDER BY count DESC, {col} LIMIT ?"
         )
         params = params + [lim]
@@ -274,9 +301,9 @@ def execute(
         where, params = _where_clause(filt)
         if field is not None:
             col = _validate_field(field, what="lookup field")
-            sql = f"SELECT key, {col} AS {col} FROM projects{where} LIMIT ?"
+            sql = f"SELECT key, {col} AS {col} FROM projects_q{where} LIMIT ?"
         else:
-            sql = f"SELECT * FROM projects{where} LIMIT ?"
+            sql = f"SELECT * FROM projects_q{where} LIMIT ?"
         params = params + [lim]
         rows = _run(sidecar_path, sql, params)
         return AggregateResult("lookup", rows, sql, params, row_count=len(rows))
@@ -301,6 +328,11 @@ def _run(sidecar_path: Path, sql: str, params: list) -> list[dict]:
     except (sqlite3.Error, OSError) as e:
         raise AggregateError(f"sidecar unavailable: {e}") from e
     try:
+        # Build the pivoted TEMP view (`projects_q`) the templates query — one column per declared
+        # facet, LEFT-JOINed onto `projects`. A TEMP view is allowed on a mode=ro main DB (sqlite's
+        # temp store is writable), so this keeps the main sidecar strictly read-only while making
+        # every adapter facet a queryable column.
+        create_query_view(conn)
         cur = conn.execute(stmt, params)
         return _rows_to_dicts(cur.fetchall())
     except sqlite3.OperationalError as e:

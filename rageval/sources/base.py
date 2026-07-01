@@ -28,7 +28,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable
 
-from ..facts import StructuredFact
+from ..facts import FacetSpec, StructuredFact
 
 
 @dataclass(frozen=True)
@@ -142,12 +142,21 @@ class SourceAdapter(abc.ABC):
 
     # ---- optional Phase-4 hooks (generic defaults so a corpus can override none) --------
 
+    def declared_facets(self) -> Iterable[FacetSpec]:
+        """(#36/#40) Declare this corpus's structured FACETS — the positive, fail-closed allowlist
+        of fields the adapter may emit as StructuredFacts, each with a value TYPE. This is the
+        source of truth for BOTH storage (only a declared facet is stored) and queryability
+        (aggregate validates a query field against the declared facets — NOT a core dataclass). The
+        engine core enumerates NO facet name; a corpus declares its own. Default: no facets."""
+        return ()
+
     def harvest_facts(self, project_id: str, project_dir: Path) -> Iterable[StructuredFact]:
         """(#36) Yield StructuredFacts for one project's metadata sidecar, from a per-project
         DESCRIPTOR (a config file / manifest / spreadsheet) that is NOT a narrative document and
         should never be embedded. The core consumes whatever facts an adapter emits and knows NO
         field names; the whitelist / fail-closed secret handling lives in the adapter's harvester
-        (built on the reusable rageval.facts primitive). Default: no structured facts."""
+        (built on the reusable rageval.facts primitive). Only facts naming a DECLARED facet are
+        stored (fail-closed). Default: no structured facts."""
         return ()
 
     def classification_policy(self) -> ClassificationPolicy:

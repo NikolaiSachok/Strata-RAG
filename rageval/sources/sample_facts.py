@@ -36,7 +36,7 @@ from typing import Iterator
 
 import yaml
 
-from ..facts import FieldWhitelistHarvester, StructuredFact
+from ..facts import FacetSpec, FieldWhitelistHarvester, StructuredFact
 
 # The ONLY keys we lift from the descriptor's `app.*` block — a WHITELIST. Maps the YAML key
 # under `app:` → the sidecar FIELD name. Anything not here (every secret block) is excluded by
@@ -50,6 +50,26 @@ _APP_FIELD_WHITELIST: dict[str, str] = {
 }
 
 _HARVESTER = FieldWhitelistHarvester(_APP_FIELD_WHITELIST)
+
+# The DECLARED facets for this corpus (#36/#40): the positive, fail-closed allowlist of fields the
+# sample adapters may emit, each with a value type. These are the sample corpus's app-shaped
+# structured fields — they live HERE, in the adapter, NOT as hardcoded core sidecar columns. The
+# generic facet store + aggregate validation derive from this declaration.
+_SAMPLE_FACETS: tuple[FacetSpec, ...] = (
+    FacetSpec("app_name", "text", "the app's product/display name"),
+    FacetSpec("domain", "text", "the homepage/website host"),
+    FacetSpec("landing_url", "text", "DERIVED: https://<domain>"),
+    FacetSpec("app_number", "text", "store/build number"),
+    FacetSpec("bundle_id", "text", "app bundle id"),
+    FacetSpec("localization", "text", "primary localization (e.g. EN)"),
+    FacetSpec("contact_emails", "text[]", "DERIVED best-effort support address(es)"),
+)
+
+
+def sample_declared_facets() -> tuple[FacetSpec, ...]:
+    """The sample corpus's declared structured facets (the app-shaped fields)."""
+    return _SAMPLE_FACETS
+
 
 # The descriptor file this corpus ships (relative to the project dir).
 _DESCRIPTOR_REL = ("back", "config.yaml")

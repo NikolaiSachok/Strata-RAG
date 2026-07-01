@@ -31,7 +31,73 @@ from dataclasses import dataclass
 
 # Belt-and-braces guard: even a WHITELISTED key is refused if its NAME looks like a secret.
 # Corpus-neutral (matches on the shape of credential-adjacent key names), so it lives in core.
-_SECRET_KEY_RE = re.compile(r"(_key|_token|secret|password|api_key|session_id)", re.IGNORECASE)
+# Kept CONSISTENT with redact._SECRET_KEY_WORDS (the ingest-time secret notion) so the two agree
+# on what "looks secret" — this catches standalone password/credential/login/apikey too, not only
+# the underscore-prefixed forms. (This is belt-and-braces; the whitelist is the primary defense.)
+_SECRET_KEY_RE = re.compile(
+    r"(api[_ -]?key|apikey|secret|access[_ -]?token|auth[_ -]?token|_token\b|token|"
+    r"password|passwd|pwd|credential|client[_ -]?secret|private[_ -]?key|login|"
+    r"session[_ -]?id)",
+    re.IGNORECASE,
+)
+
+# Facet value TYPES a corpus may declare. These drive both COERCION (a value is validated/cast to
+# its facet type before storage) and QUERYABILITY (numeric facets support sum/avg; all support
+# count/group_by/list/lookup). Corpus-neutral — an adapter picks the type per facet.
+FACET_TYPES: frozenset[str] = frozenset({"text", "int", "real", "bool", "text[]"})
+
+
+@dataclass(frozen=True)
+class FacetSpec:
+    """One adapter-DECLARED structured facet (#36/#40): the positive, fail-closed allowlist entry
+    that makes a field both WRITABLE (a harvested fact for it is stored) and QUERYABLE (aggregate
+    validates against declared facets, not a dataclass). The core knows NO facet name; the adapter
+    declares them.
+
+    name        — the facet/field name (the StructuredFact.field it accepts).
+    type        — one of FACET_TYPES; drives value coercion + which aggregations are honest.
+    description — a short human note (surfaced in observability; optional).
+    """
+
+    name: str
+    type: str = "text"
+    description: str = ""
+
+    def __post_init__(self):
+        if not (self.name and self.name.strip()):
+            raise ValueError("FacetSpec.name must be a non-empty string")
+        if self.type not in FACET_TYPES:
+            raise ValueError(
+                f"FacetSpec {self.name!r}: type {self.type!r} not in {sorted(FACET_TYPES)}")
+
+
+def coerce_facet_value(value: object, facet_type: str) -> object:
+    """Validate + coerce a fact value to its declared facet type. Raises ValueError on a value that
+    can't be represented as that type (a MISTYPED fact — the caller degrades that ONE facet, never
+    crashing the batch). Returns the coerced value (JSON-serialisable for storage)."""
+    if value is None:
+        return None
+    if facet_type == "text":
+        return str(value)
+    if facet_type == "int":
+        if isinstance(value, bool):  # bool is an int subclass; reject to avoid silent True==1
+            raise ValueError(f"expected int, got bool {value!r}")
+        return int(value)
+    if facet_type == "real":
+        if isinstance(value, bool):
+            raise ValueError(f"expected real, got bool {value!r}")
+        return float(value)
+    if facet_type == "bool":
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)) and value in (0, 1):
+            return bool(value)
+        raise ValueError(f"expected bool, got {value!r}")
+    if facet_type == "text[]":
+        if isinstance(value, (list, tuple)):
+            return [str(v) for v in value]
+        raise ValueError(f"expected list for text[], got {type(value).__name__}")
+    raise ValueError(f"unknown facet type {facet_type!r}")  # pragma: no cover
 
 
 @dataclass(frozen=True)

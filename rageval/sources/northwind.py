@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Iterable
 
 from .base import ClassificationPolicy, SourceAdapter, SourceDoc
-from .sample_facts import harvest_facts_for
+from .sample_facts import harvest_facts_for, sample_declared_facets
 from .sample_policy import (
     docs_txt_doc_type,
     is_metadata_only_file,
@@ -94,6 +94,10 @@ class NorthwindAdapter(SourceAdapter):
                     raw_text=text,
                     folder_meta={"project_dir": project_dir.name},
                 )
+
+    def declared_facets(self):
+        """(#36) This corpus's declared structured facets (sources/sample_facts)."""
+        return sample_declared_facets()
 
     def harvest_facts(self, project_id: str, project_dir: Path):
         """(#36) Structured facts from this project's back/config.yaml descriptor. The concrete
