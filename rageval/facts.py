@@ -46,6 +46,23 @@ _SECRET_KEY_RE = re.compile(
 # count/group_by/list/lookup). Corpus-neutral — an adapter picks the type per facet.
 FACET_TYPES: frozenset[str] = frozenset({"text", "int", "real", "bool", "text[]"})
 
+# A facet NAME must be a strict SQL identifier: the aggregate templates interpolate the column name
+# UNQUOTED (`SELECT DISTINCT {col}`, `GROUP BY {col}`, `{fname} = ?`), so a keyword/numeric/spaced
+# name would be advertised-queryable but raise at query time. Enforcing this at DECLARATION makes a
+# bad facet fail LOUD, guaranteeing every declared facet is actually queryable. (These names come
+# from adapter DECLARATIONS, never user/LLM input, so a valid identifier is safe to interpolate.)
+_FACET_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+# The GENERIC engine-owned `projects` columns (structural + LLM-enrichment + provenance) + the
+# synthesized primary `key`. A declared facet must NOT collide with any of these: in the pivot view
+# `p.*` would SHADOW the facet (its value silently dropped). SINGLE SOURCE OF TRUTH — aggregate.py
+# imports this set, and sidecar.py's `projects` DDL must stay in sync with it.
+RESERVED_FACET_NAMES: frozenset[str] = frozenset({
+    "key", "project_id", "source_set", "app_category", "theme_tags", "has_humor",
+    "doc_types", "one_line_summary", "chunk_count", "kotlin_source_id", "status",
+    "non_conforming", "metadata_confidence", "publisher",
+})
+
 
 @dataclass(frozen=True)
 class FacetSpec:
@@ -54,7 +71,10 @@ class FacetSpec:
     validates against declared facets, not a dataclass). The core knows NO facet name; the adapter
     declares them.
 
-    name        — the facet/field name (the StructuredFact.field it accepts).
+    name        — the facet/field name (the StructuredFact.field it accepts). Validated at
+                  construction to a strict SQL identifier that does NOT collide with a generic
+                  `projects` column — so every declared facet is guaranteed queryable and can never
+                  shadow an engine column. A bad name fails LOUD here, at declaration.
     type        — one of FACET_TYPES; drives value coercion + which aggregations are honest.
     description — a short human note (surfaced in observability; optional).
     """
@@ -66,6 +86,19 @@ class FacetSpec:
     def __post_init__(self):
         if not (self.name and self.name.strip()):
             raise ValueError("FacetSpec.name must be a non-empty string")
+        if not _FACET_NAME_RE.match(self.name):
+            raise ValueError(
+                f"FacetSpec name {self.name!r} is not a valid SQL identifier "
+                f"(must match {_FACET_NAME_RE.pattern} — letters/digits/underscore, not starting "
+                f"with a digit, no spaces/keywords-as-symbols). The aggregate templates interpolate "
+                f"the column name unquoted, so such a facet would be stored but not queryable."
+            )
+        if self.name in RESERVED_FACET_NAMES:
+            raise ValueError(
+                f"FacetSpec name {self.name!r} collides with a generic engine column "
+                f"({', '.join(sorted(RESERVED_FACET_NAMES))}). A colliding facet would be silently "
+                f"shadowed by the `projects` column in the query view — pick a different name."
+            )
         if self.type not in FACET_TYPES:
             raise ValueError(
                 f"FacetSpec {self.name!r}: type {self.type!r} not in {sorted(FACET_TYPES)}")
@@ -82,11 +115,22 @@ def coerce_facet_value(value: object, facet_type: str) -> object:
     if facet_type == "int":
         if isinstance(value, bool):  # bool is an int subclass; reject to avoid silent True==1
             raise ValueError(f"expected int, got bool {value!r}")
-        return int(value)
+        # Reject non-finite floats explicitly (int(nan) → ValueError, int(inf) → OverflowError;
+        # normalise both to a clear ValueError the caller already catches).
+        if isinstance(value, float) and (value != value or value in (float("inf"), float("-inf"))):
+            raise ValueError(f"expected a finite int, got {value!r}")
+        try:
+            return int(value)
+        except OverflowError as e:  # pragma: no cover - covered by the float guard above
+            raise ValueError(f"expected a finite int, got {value!r}") from e
     if facet_type == "real":
         if isinstance(value, bool):
             raise ValueError(f"expected real, got bool {value!r}")
-        return float(value)
+        x = float(value)
+        # Reject non-finite values so a nan/inf can't poison a group_by / ordering.
+        if x != x or x in (float("inf"), float("-inf")):
+            raise ValueError(f"expected a finite real, got {value!r}")
+        return x
     if facet_type == "bool":
         if isinstance(value, bool):
             return value

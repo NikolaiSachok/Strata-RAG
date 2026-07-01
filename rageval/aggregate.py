@@ -33,6 +33,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .config import SIDECAR_PATH
+from .facts import RESERVED_FACET_NAMES
 from .sidecar import create_query_view
 
 # ---------------------------------------------------------------------------
@@ -40,12 +41,10 @@ from .sidecar import create_query_view
 # ---------------------------------------------------------------------------
 
 # The GENERIC engine-owned columns on `projects` (structural + enrichment + provenance), plus the
-# synthesized primary `key`. NO corpus-specific structured-fact name lives here.
-_GENERIC_FIELDS: frozenset[str] = frozenset({
-    "key", "project_id", "source_set", "app_category", "theme_tags", "has_humor",
-    "doc_types", "one_line_summary", "chunk_count", "kotlin_source_id", "status",
-    "non_conforming", "metadata_confidence", "publisher",
-})
+# synthesized primary `key`. NO corpus-specific structured-fact name lives here. SINGLE SOURCE OF
+# TRUTH is facts.RESERVED_FACET_NAMES — the same set FacetSpec forbids a facet from colliding with,
+# so "generic column" means exactly one thing across the engine.
+_GENERIC_FIELDS: frozenset[str] = RESERVED_FACET_NAMES
 
 # Generic JSON-array columns (stored as TEXT holding a JSON list). Equality filters and DISTINCT
 # over these are imperfect (they match the serialized blob), so we only allow them where it's
@@ -180,22 +179,36 @@ def _clamp_limit(limit: int | None) -> int:
     return min(int(limit), MAX_LIMIT)
 
 
+def _qi(name: str) -> str:
+    """Quote a validated column/facet identifier for interpolation into a template.
+
+    The name is ALREADY whitelisted (a generic column or a declared facet, both validated to a
+    strict SQL identifier at declaration) — never user/LLM input — so this is not an
+    injection guard but a CORRECTNESS one: double-quoting lets a facet whose name happens to be a
+    SQL keyword (e.g. `order`, `group`) still be queried, matching how the pivot view quotes its
+    facet columns. Belt-and-braces: reject an embedded double-quote (impossible past validation)."""
+    if '"' in name:  # pragma: no cover - validation already forbids this
+        raise AggregateError(f"invalid identifier {name!r}")
+    return f'"{name}"'
+
+
 def _where_clause(filt: dict[str, object]) -> tuple[str, list]:
     """Build a parameterized WHERE from a validated filter map. Keys are already whitelisted
-    column names (safe to inline); VALUES are bound as ? params. Booleans map to 0/1 to match
-    the sidecar's INTEGER storage; None means IS NULL."""
+    column names (quoted for safe interpolation); VALUES are bound as ? params. Booleans map to
+    0/1 to match the sidecar's INTEGER storage; None means IS NULL."""
     if not filt:
         return "", []
     parts: list[str] = []
     params: list = []
     for fname, value in filt.items():
+        col = _qi(fname)
         if value is None:
-            parts.append(f"{fname} IS NULL")
+            parts.append(f"{col} IS NULL")
         elif isinstance(value, bool):
-            parts.append(f"{fname} = ?")
+            parts.append(f"{col} = ?")
             params.append(1 if value else 0)
         else:
-            parts.append(f"{fname} = ?")
+            parts.append(f"{col} = ?")
             params.append(value)
     return " WHERE " + " AND ".join(parts), params
 
@@ -262,19 +275,21 @@ def execute(
 
     if intent == "list":
         col = _validate_field(field, what="list field")
+        qcol = _qi(col)
         where, params = _where_clause(filt)
         # DISTINCT values of one column (the common "list all brands / categories" question).
-        sql = f"SELECT DISTINCT {col} AS {col} FROM projects_q{where} ORDER BY {col} LIMIT ?"
+        sql = f"SELECT DISTINCT {qcol} AS {qcol} FROM projects_q{where} ORDER BY {qcol} LIMIT ?"
         params = params + [lim]
         rows = _run(sidecar_path, sql, params)
         return AggregateResult("list", rows, sql, params, row_count=len(rows))
 
     if intent == "group_by_count":
         col = _validate_field(field, what="group-by field")
+        qcol = _qi(col)
         where, params = _where_clause(filt)
         sql = (
-            f"SELECT {col} AS {col}, COUNT(*) AS count FROM projects_q{where} "
-            f"GROUP BY {col} ORDER BY count DESC, {col} LIMIT ?"
+            f"SELECT {qcol} AS {qcol}, COUNT(*) AS count FROM projects_q{where} "
+            f"GROUP BY {qcol} ORDER BY count DESC, {qcol} LIMIT ?"
         )
         params = params + [lim]
         rows = _run(sidecar_path, sql, params)
@@ -283,10 +298,11 @@ def execute(
     if intent == "top_n":
         # top-N is group_by_count with a tighter LIMIT (the N). Same vetted template.
         col = _validate_field(field, what="top-n field")
+        qcol = _qi(col)
         where, params = _where_clause(filt)
         sql = (
-            f"SELECT {col} AS {col}, COUNT(*) AS count FROM projects_q{where} "
-            f"GROUP BY {col} ORDER BY count DESC, {col} LIMIT ?"
+            f"SELECT {qcol} AS {qcol}, COUNT(*) AS count FROM projects_q{where} "
+            f"GROUP BY {qcol} ORDER BY count DESC, {qcol} LIMIT ?"
         )
         params = params + [lim]
         rows = _run(sidecar_path, sql, params)
@@ -301,7 +317,8 @@ def execute(
         where, params = _where_clause(filt)
         if field is not None:
             col = _validate_field(field, what="lookup field")
-            sql = f"SELECT key, {col} AS {col} FROM projects_q{where} LIMIT ?"
+            qcol = _qi(col)
+            sql = f"SELECT key, {qcol} AS {qcol} FROM projects_q{where} LIMIT ?"
         else:
             sql = f"SELECT * FROM projects_q{where} LIMIT ?"
         params = params + [lim]
