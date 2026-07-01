@@ -34,9 +34,23 @@ import json
 import re
 from dataclasses import dataclass, field
 
+from . import query_classes as qc
 from .llm import LLMBackend
 
-VALID_ROUTES = ("semantic", "aggregation", "lookup", "hybrid")
+# The GENERIC routes the core always ships. The FULL valid set (these + any corpus-registered
+# extra classes, e.g. multi_hop) is resolved dynamically via query_classes.valid_routes() so the
+# core router never enumerates a corpus-specific route string.
+GENERIC_ROUTES = qc.GENERIC_CLASSES
+
+
+def _valid_routes() -> tuple[str, ...]:
+    """Generic routes + any corpus-registered extra query classes (#38)."""
+    return qc.valid_routes()
+
+
+# Back-compat module constant (the generic set); the router validates against _valid_routes() so
+# registered extras are accepted too.
+VALID_ROUTES = GENERIC_ROUTES
 
 
 @dataclass
@@ -86,13 +100,26 @@ _AGG_RE = re.compile("|".join(_AGG_PATTERNS), re.IGNORECASE)
 
 
 def rule_prefilter(question: str) -> RouteDecision | None:
-    """Cheap deterministic short-circuit. Returns an aggregation RouteDecision for an obvious
-    structural phrasing, else None (defer to the LLM classifier).
+    """Cheap deterministic short-circuit. Returns a RouteDecision for an obvious phrasing, else
+    None (defer to the LLM classifier).
 
-    This is the 'save an LLM call on the easy cases' tier. It only ever ASSERTS aggregation
-    (the unambiguous direction); it never asserts semantic — a non-match just means 'not
-    obviously aggregation, ask the model'."""
+    Deterministic-first, and EXTENSIBLE (#38): a corpus-registered query class's own deterministic
+    detector runs FIRST (so e.g. a multi_hop corpus can catch its cross-document phrasings before
+    the generic aggregation rule), then the generic aggregation pre-filter. It only ever ASSERTS a
+    structural route; it never asserts semantic — a non-match just means 'ask the model'."""
     q = question.strip()
+    # 0. Corpus-registered class detectors (deterministic) run first.
+    hit = qc.detect(q)
+    if hit is not None:
+        klass, confidence, slots = hit
+        return RouteDecision(
+            route=klass.name,
+            confidence=confidence,
+            reasoning=f"Rule pre-filter matched registered query class {klass.name!r}.",
+            method="rule",
+            slots=slots or {},
+        )
+    # 1. Generic aggregation phrasing.
     m = _AGG_RE.search(q)
     if not m:
         return None
@@ -151,9 +178,10 @@ def _decision_from_llm(data: dict) -> RouteDecision:
     """Normalize the model's raw JSON into a validated RouteDecision (defensive defaults so a
     garbled field can never crash dispatch)."""
     route = str(data.get("route", "")).lower().strip()
-    if route not in VALID_ROUTES:
+    if route not in _valid_routes():
         # Unknown/garbled route → safest default is semantic (it can answer anything, even if
-        # imperfectly), so the user always gets a response.
+        # imperfectly), so the user always gets a response. Validated against the FULL set
+        # (generic + corpus-registered), so a corpus class the LLM proposed by name is accepted.
         route = "semantic"
     try:
         confidence = float(data.get("confidence", 0.5))
@@ -179,9 +207,16 @@ def llm_classify(question: str, llm: LLMBackend) -> RouteDecision:
     """Ask the LLM for a structured route decision. `llm` is any object with
     `.complete(system, prompt) -> str`; tests pass a fake. On any backend/parse failure we
     return a low-confidence SEMANTIC decision so routing never hard-fails the request."""
+    # Append any corpus-registered EXTRA query classes so the LLM can propose them by name (#38);
+    # empty when none are registered → the generic prompt is unchanged.
+    extras = qc.describe_extras()
+    system = ROUTER_SYSTEM_PROMPT
+    if extras:
+        system = (f"{ROUTER_SYSTEM_PROMPT}\n\nThis corpus ALSO supports these additional routes "
+                  f"(use one only when it clearly fits):\n{extras}")
     prompt = f"QUESTION:\n{question}\n\nReturn the JSON route verdict now."
     try:
-        raw = llm.complete(ROUTER_SYSTEM_PROMPT, prompt, max_tokens=200)
+        raw = llm.complete(system, prompt, max_tokens=200)
     except Exception as e:  # noqa: BLE001 — never let routing crash the pipeline
         return RouteDecision(route="semantic", confidence=0.3,
                              reasoning=f"LLM classifier unavailable ({e}); defaulting to semantic.",

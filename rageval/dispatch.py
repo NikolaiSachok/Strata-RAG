@@ -24,6 +24,7 @@ to the semantic retriever, labelled as a basic two-step. The richer agentic deco
 from __future__ import annotations
 
 from . import aggregate
+from . import query_classes as qc
 from . import router as router_mod
 from .generate import Answer, RagPipeline
 from .router import RouteDecision
@@ -114,6 +115,17 @@ def dispatch(question: str, pipeline: RagPipeline, *,
     semantic on empty/invalid results (flagged in the block)."""
     classifier_llm = llm if llm is not None else getattr(pipeline, "llm", None)
     decision = router_mod.route(question, classifier_llm, use_rules=use_rules)
+
+    # CORPUS-REGISTERED extra query class (#38): if the route names a registered class with its own
+    # executor, run it. It returns an Answer, or None to fall back to the generic semantic path.
+    extra = qc.get(decision.route)
+    if extra is not None and extra.execute is not None:
+        ans = extra.execute(question, decision, pipeline)
+        if ans is not None:
+            if getattr(ans, "routing", None) is None:
+                ans.routing = _routing_block(decision, executed_route=decision.route)
+            return ans
+        return _run_semantic(pipeline, question, decision, fell_back=True)
 
     if decision.route in ("aggregation", "lookup"):
         ans = _try_aggregation(question, decision)

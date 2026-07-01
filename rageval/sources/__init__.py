@@ -19,17 +19,22 @@ adapter; nothing downstream changes. This is the Strategy pattern, and it's exac
 
 from __future__ import annotations
 
+from ..query_classes import QueryClass, register_query_class
 from ..roster import register_family
-from .base import SourceAdapter, SourceDoc
+from .base import ClassificationPolicy, FileRule, SourceAdapter, SourceDoc
 from .registry import discover_all, get_adapters, register_adapter
 
 __all__ = [
     "SourceAdapter",
     "SourceDoc",
+    "ClassificationPolicy",
+    "FileRule",
+    "QueryClass",
     "discover_all",
     "get_adapters",
     "register_adapter",
     "register_family",
+    "register_query_class",
 ]
 
 # Load optional plugins (in-package bootstrap + $RAGEVAL_PLUGINS_DIR) LAST — only now that every
