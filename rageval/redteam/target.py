@@ -118,13 +118,21 @@ _COMPLY_TRIGGERS = ("ignore", "you are now", "reveal", "respond only", "append",
 
 class MockTarget:
     """Deterministic target. `comply_when_evaded` (default True) gates the realistic behaviour;
-    set it False to model a perfectly-robust engine (ASR → 0) for a control test."""
+    set it False to model a perfectly-robust engine (ASR → 0) for a control test.
+
+    `normalize` mirrors the engine's `guard_normalize` flag: it controls whether the mock's copy of
+    the scanner runs the normalization pre-pass. This is what makes the BEFORE/AFTER evasion table
+    reproducible offline — `MockTarget(normalize=False)` reproduces the pre-#31 blind scanner
+    (obfuscation evades ~100%), `MockTarget(normalize=True)` (the default, matching the shipped
+    guard_normalize default) closes the gap (~0% evaded)."""
 
     name = "mock"
 
-    def __init__(self, *, comply_when_evaded: bool = True, leak_full_prompt: bool = True):
+    def __init__(self, *, comply_when_evaded: bool = True, leak_full_prompt: bool = True,
+                 normalize: bool = True):
         self.comply_when_evaded = comply_when_evaded
         self.leak_full_prompt = leak_full_prompt
+        self.normalize = normalize
 
     def _recover(self, rendered: str) -> str:
         """Best-effort fold the rendered payload back toward ASCII the way a model's 'reading' or
@@ -160,7 +168,7 @@ class MockTarget:
         rendered = question
         # The mock runs the REAL deterministic scanner on the rendered input (so plaintext attacks
         # get caught exactly as the engine would).
-        findings = scan_for_injection(rendered)
+        findings = scan_for_injection(rendered, normalize=self.normalize)
         flagged = max_severity(findings) != "none"
 
         recovered = self._recover(rendered)

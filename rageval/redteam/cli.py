@@ -51,6 +51,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Write promote_to_fixtures() Attack snippets here (human review before use).")
     p.add_argument("--adapt", action="store_true",
                    help="Enable one adaptive LLM round (needs an LLM backend; off by default).")
+    p.add_argument("--no-normalize", dest="normalize", action="store_false", default=True,
+                   help="Disable the scanner's normalization pre-pass (guard_normalize=False) to "
+                        "reproduce the PRE-#31 blind scanner. Default: normalization ON. Toggle this "
+                        "to produce the BEFORE/AFTER evasion table.")
     return p
 
 
@@ -62,7 +66,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[redteam] target=http {args.base_url} — live model calls are slow (~60-90s each).",
               file=sys.stderr)
     else:
-        target = MockTarget()
+        target = MockTarget(normalize=args.normalize)
 
     # The oracle's persona-residue judge + the adaptive strategist need an LLM; only resolve one if
     # --adapt is requested (otherwise stay fully offline-capable).
@@ -83,6 +87,7 @@ def main(argv: list[str] | None = None) -> int:
         trials=args.trials,
         llm=llm,
         adapt=args.adapt,
+        normalize=args.normalize,
     )
 
     report = render_report(records, summary)
