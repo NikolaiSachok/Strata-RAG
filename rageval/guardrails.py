@@ -117,6 +117,19 @@ _INJECTION_PATTERNS: list[tuple[str, str, re.Pattern]] = [
 ]
 
 
+# C0 (U+0000–U+001F) + DEL + C1 (U+007F–U+009F) control characters. A snippet flows into the
+# GuardrailReport and out through the API JSON / logs, so raw control bytes (ESC `\x1b[…`, BEL
+# `\x07`) recovered from a decoded carrier are a terminal-/log-spoofing vector. We strip them
+# CENTRALLY here so EVERY variant (original + normalized + decoded base64/morse/rot13) is covered,
+# not just the base64 path (which happened to gate on `.isprintable()`).
+_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+
+
+def _sanitize_snippet(snippet: str) -> str:
+    """Collapse newlines and STRIP all C0/C1 control chars so a snippet is safe to serialize."""
+    return _CONTROL_CHARS.sub(" ", snippet).strip()
+
+
 def _scan_variant(text: str, where: str) -> list[Finding]:
     """Run the literal-ASCII regexes over ONE string. Snippets/offsets index THIS string, so the
     caller must only ever pair a variant's findings with the variant they were computed from."""
@@ -124,7 +137,7 @@ def _scan_variant(text: str, where: str) -> list[Finding]:
     for pattern_id, severity, rx in _INJECTION_PATTERNS:
         for m in rx.finditer(text or ""):
             start = max(0, m.start() - 20)
-            snippet = text[start : m.end() + 20].replace("\n", " ").strip()
+            snippet = _sanitize_snippet(text[start : m.end() + 20])
             findings.append(Finding(pattern=pattern_id, severity=severity,
                                     snippet=snippet[:160], where=where))
     return findings
@@ -148,32 +161,39 @@ def scan_for_injection(text: str, *, where: str = "", normalize: bool = True) ->
          a normalized match's offsets don't line up with the original string),
       3. BOUNDED decoded carrier segments (base64/morse/rot13), each normalized then scanned;
          stamped `+decoded`.
-    We DEDUP on `(pattern, snippet)` — coarser than that (e.g. `(pattern, severity)`) would collapse
-    genuinely distinct hits; the snippet distinguishes them while still merging the same hit seen on
-    two views. The ORIGINAL `text` is always preserved for the answer/citations — normalization is
-    scan-only.
+    DEDUP is CROSS-VARIANT ONLY. We suppress an echo where the SAME `(pattern, snippet)` hit shows
+    up on a later view (e.g. a trigger seen both raw and after normalization) — but we NEVER drop a
+    genuine WITHIN-variant duplicate (a text that literally repeats the trigger twice must yield two
+    findings). So we process variant-by-variant: keep every finding a variant produces unless its key
+    already appeared in a PRIOR variant, and only fold a variant's keys into the seen-set AFTER the
+    whole variant is processed. `(pattern, snippet)` is the key — coarser (e.g. `(pattern, severity)`)
+    would over-merge distinct hits. The ORIGINAL `text` is always preserved for the answer/citations
+    — normalization is scan-only.
 
     `normalize=False` restores the pure original-only behaviour (used to MEASURE the layer's effect,
     and set by the caller from `guard_normalize`)."""
-    findings: list[Finding] = _scan_variant(text, where)
+    variants: list[list[Finding]] = [_scan_variant(text, where)]
     if normalize:
         norm = _normalize_text(text or "")
         if norm != (text or ""):
-            findings += _scan_variant(norm, f"{where}+normalized" if where else "normalized")
+            variants.append(_scan_variant(norm, f"{where}+normalized" if where else "normalized"))
         for seg in _decode_and_rescan_segments(text or ""):
             # Decoded carriers are re-normalized before scanning (a decoded blob can itself be
             # obfuscated). Snippets index the decoded segment, stamped so the report is explicit.
             seg_norm = _normalize_text(seg)
-            findings += _scan_variant(seg_norm, f"{where}+decoded" if where else "decoded")
+            variants.append(_scan_variant(seg_norm, f"{where}+decoded" if where else "decoded"))
 
-    # Union + dedup on (pattern, snippet): merge the same hit seen across views, keep distinct hits.
+    # Cross-variant echo suppression that preserves within-variant duplicates: a finding is kept
+    # unless its (pattern, snippet) already appeared in a PRIOR variant; each variant's keys are
+    # merged into `seen` only AFTER the whole variant is processed.
     deduped: list[Finding] = []
     seen: set[tuple[str, str]] = set()
-    for f in findings:
-        key = (f.pattern, f.snippet)
-        if key not in seen:
-            seen.add(key)
-            deduped.append(f)
+    for variant_findings in variants:
+        for f in variant_findings:
+            key = (f.pattern, f.snippet)
+            if key not in seen:
+                deduped.append(f)
+        seen.update((f.pattern, f.snippet) for f in variant_findings)
     return deduped
 
 
