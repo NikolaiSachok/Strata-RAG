@@ -12,7 +12,8 @@ from __future__ import annotations
 from pathlib import Path
 
 from rageval.enrich import enrich_all
-from rageval.sidecar import ProjectRecord, all_projects, connect, upsert_project
+from tests._helpers import make_record
+from rageval.sidecar import all_projects, connect, upsert_project
 from rageval.sources.base import SourceDoc
 
 
@@ -44,10 +45,10 @@ def test_marker_status_reaches_record_without_llm():
 def test_sidecar_round_trips_provenance_columns(tmp_path):
     db = tmp_path / "side.sqlite"
     conn = connect(db)
-    upsert_project(conn, ProjectRecord(
+    upsert_project(conn, make_record(
         project_id="2023", source_set="northwind", app_name="Aurora Drift",
         publisher="Neon Spins", kotlin_source_id="1798", chunk_count=1))
-    upsert_project(conn, ProjectRecord(
+    upsert_project(conn, make_record(
         project_id="1788", source_set="northwind-archive", status="banned",
         non_conforming=True, doc_types=["marker"], chunk_count=1))
     conn.close()
@@ -56,8 +57,9 @@ def test_sidecar_round_trips_provenance_columns(tmp_path):
     recs = {r.key: r for r in all_projects(conn2)}
     # Lineage query: "what was project 2023 ported from?"
     assert recs["northwind/2023"].kotlin_source_id == "1798"
-    # The two distinct name facets round-trip independently.
-    assert recs["northwind/2023"].app_name == "Aurora Drift"
+    # The two distinct name facets round-trip independently: app_name is an ADAPTER FACET
+    # (schema-agnostic store), publisher is the generic roster column.
+    assert recs["northwind/2023"].fact("app_name") == "Aurora Drift"
     assert recs["northwind/2023"].publisher == "Neon Spins"
     # Conformance query: "which projects are banned / non-conforming?"
     banned = [r for r in recs.values() if r.status == "banned"]

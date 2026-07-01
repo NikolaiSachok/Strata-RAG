@@ -52,6 +52,14 @@ class QueryClass:
 
 # The registry: name → QueryClass. Only EXTRA (non-generic) classes live here; the generic four
 # are handled by the core router/dispatch directly. Last-wins so a re-register replaces.
+#
+# CONSTRAINT — process-global, ONE corpus per process. This is module-level MUTABLE state shared by
+# every corpus in the interpreter (like sources.registry.ADAPTER_BY_FOLDER and
+# roster._FAMILY_TO_TSV_STEM). Two corpora registering different query classes in the SAME process
+# would cross-misroute. Today the engine serves one corpus per process; the test suite resets these
+# globals between tests via an autouse fixture (tests/conftest.py). Follow-up: per-corpus registry
+# scoping (a Corpus/Engine object owning its own registries) — tracked as "follow-up: per-corpus
+# registry scoping".
 _REGISTRY: dict[str, QueryClass] = {}
 
 

@@ -65,7 +65,7 @@ def test_enrich_fallback_uses_settings_md_structured_fields_without_llm():
         _doc("settings.md", "metadata", "Brand: Lemon Ledger\nCategory: budgeting\nTheme: citrus"),
     ]
     rec = enrich_project(None, "atlas", "p1", docs, chunk_count=3)
-    assert rec.app_name == "Lemon Ledger"
+    assert rec.fact("app_name") == "Lemon Ledger"
     assert rec.app_category == "budgeting"
     assert "citrus" in rec.theme_tags
     # The metadata doc_type is recorded (sidecar observability), proving it reached enrich.
@@ -81,7 +81,7 @@ def test_enrich_degrades_gracefully_without_settings_md():
     assert rec.doc_types == ["spec"]
     assert rec.chunk_count == 2
     # No structured source → app_name/category stay None (honest null), not invented.
-    assert rec.app_name is None and rec.app_category is None
+    assert rec.fact("app_name") is None and rec.app_category is None
 
 
 def test_enrich_seeds_app_name_from_folder_hint_when_no_settings():
@@ -90,7 +90,7 @@ def test_enrich_seeds_app_name_from_folder_hint_when_no_settings():
     docs = [_doc("2285 BowlMaster (Bowling).md", "description", "Bowling score manager.",
                  folder_meta={"brand_hint": "BowlMaster", "theme_hint": "Bowling Score Manager"})]
     rec = enrich_project(None, "northwind-spec", "2285", docs, chunk_count=1)
-    assert rec.app_name == "BowlMaster"
+    assert rec.fact("app_name") == "BowlMaster"
     assert "bowling score manager" in rec.theme_tags
 
 
@@ -109,14 +109,15 @@ def test_enrich_harvests_config_yaml_into_record():
     and the bounded contact-email is derived AND flagged."""
     rec = enrich_project(None, "atlas", "atlas-vista", [_sample_doc("atlas-vista", "index.php")],
                          chunk_count=1)
-    assert rec.domain == "vista-weather-7011.test"
-    assert rec.landing_url == "https://vista-weather-7011.test"
-    assert rec.app_name == "Vista Weather"
-    assert rec.app_number == "7011"
-    assert rec.contact_emails == ["support@vista-weather-7011.test"]
-    assert rec.contact_emails_derived is True
+    assert rec.fact("domain") == "vista-weather-7011.test"
+    assert rec.fact("landing_url") == "https://vista-weather-7011.test"
+    assert rec.fact("app_name") == "Vista Weather"
+    assert rec.fact("app_number") == "7011"
+    assert rec.fact("contact_emails") == ["support@vista-weather-7011.test"]
+    # contact_emails came from a DERIVED template scan → provenance flagged 'derived'.
+    assert rec.facts_provenance.get("contact_emails") == "derived"
     # config.yaml app.name is the app_name (product/display name).
-    assert rec.app_name == "Vista Weather"
+    assert rec.fact("app_name") == "Vista Weather"
 
 
 def test_enrich_harvest_never_writes_secrets_to_record():
@@ -141,10 +142,10 @@ def test_enrich_settings_md_app_name_yields_to_config_yaml_when_present():
     rec = enrich_project(None, "atlas", "atlas-ledger", docs, chunk_count=2)
     # config.yaml app.name ('Lemon Ledger') is the app_name; it is a PRODUCT name, never the
     # publisher. (Here settings.md and config.yaml agree on the product name.)
-    assert rec.app_name == "Lemon Ledger"
+    assert rec.fact("app_name") == "Lemon Ledger"
     assert rec.app_category == "budgeting"       # settings.md category stands
-    assert rec.domain == "lemon-ledger-7022.test"
-    assert rec.landing_url == "https://lemon-ledger-7022.test"
+    assert rec.fact("domain") == "lemon-ledger-7022.test"
+    assert rec.fact("landing_url") == "https://lemon-ledger-7022.test"
 
 
 def test_enrich_no_config_yaml_leaves_harvest_fields_none():
@@ -153,8 +154,9 @@ def test_enrich_no_config_yaml_leaves_harvest_fields_none():
     docs = [_doc("description.md", "description", "A simple app.", project_id="atlas-orchard")]
     # doc_path here is a bare Path (no project-dir ancestor) → harvest finds nothing.
     rec = enrich_project(None, "atlas", "atlas-orchard", docs, chunk_count=1)
-    assert rec.domain is None and rec.landing_url is None and rec.app_name is None
-    assert rec.contact_emails == []
+    assert rec.fact("domain") is None and rec.fact("landing_url") is None
+    assert rec.fact("app_name") is None
+    assert rec.fact("contact_emails") is None
 
 
 # --- concurrent enrichment (ThreadPool): equivalence, isolation, thread-safety -----------

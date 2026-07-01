@@ -92,11 +92,11 @@ def test_app_name_and_publisher_are_distinct_fields():
     docs = [_doc("settings.md", "metadata",
                  "Brand: Citrus Garden\nCategory: to-do\nTheme: citrus", project_id="0001")]
     rec = enrich_project(None, "northwind", "0001", docs, chunk_count=1, roster=r)
-    # The doc-stated product title → app_name.
-    assert rec.app_name == "Citrus Garden"
-    # The publisher is the authoritative TSV value — DIFFERENT from app_name.
+    # The doc-stated product title → app_name (an adapter FACET in the schema-agnostic store).
+    assert rec.fact("app_name") == "Citrus Garden"
+    # The publisher is the authoritative TSV value (generic column) — DIFFERENT from app_name.
     assert rec.publisher == "Maple Lagoon"
-    assert rec.app_name != rec.publisher
+    assert rec.fact("app_name") != rec.publisher
 
 
 def test_publisher_null_for_named_project_without_numeric_id():

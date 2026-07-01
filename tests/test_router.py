@@ -18,7 +18,8 @@ import pytest
 from rageval import aggregate, router
 from rageval.dispatch import dispatch
 from rageval.generate import Answer
-from rageval.sidecar import ProjectRecord, connect, upsert_project
+from tests._helpers import make_record
+from rageval.sidecar import connect, upsert_project
 
 
 # ===========================================================================
@@ -31,13 +32,13 @@ def fixture_sidecar(tmp_path):
     db = tmp_path / "side.sqlite"
     conn = connect(db)
     rows = [
-        ProjectRecord(project_id="1", source_set="northwind", publisher="Maple",
+        make_record(project_id="1", source_set="northwind", publisher="Maple",
                       app_category="game", app_name="Alpha", chunk_count=3),
-        ProjectRecord(project_id="2", source_set="northwind", publisher="Maple",
+        make_record(project_id="2", source_set="northwind", publisher="Maple",
                       app_category="utility", app_name="Beta", chunk_count=5),
-        ProjectRecord(project_id="3", source_set="northwind", publisher="Cedar",
+        make_record(project_id="3", source_set="northwind", publisher="Cedar",
                       app_category="game", app_name="Gamma", chunk_count=2),
-        ProjectRecord(project_id="4", source_set="atlas", publisher="Cedar",
+        make_record(project_id="4", source_set="atlas", publisher="Cedar",
                       app_category="game", app_name="Delta", chunk_count=1, status="banned"),
     ]
     for r in rows:
@@ -220,13 +221,17 @@ def test_connection_is_read_only(fixture_sidecar):
     conn.close()
 
 
-def test_allowed_fields_derived_from_record():
-    # The whitelist tracks the sidecar's ProjectRecord (single source of truth), so a schema
-    # change updates the guard automatically.
-    assert "publisher" in aggregate.ALLOWED_FIELDS
-    assert "app_category" in aggregate.ALLOWED_FIELDS
-    assert "key" in aggregate.ALLOWED_FIELDS
-    assert "evil_column" not in aggregate.ALLOWED_FIELDS
+def test_allowed_fields_is_generic_columns_plus_declared_facets():
+    # The queryable allowlist is the GENERIC `projects` columns UNIONed with adapter-DECLARED
+    # facets (#36) — derived from adapter declarations, NOT a dataclass. So generic columns are
+    # always present, the sample adapters' declared facets (app_name/domain) are queryable, and an
+    # undeclared field is rejected (fail-closed).
+    allowed = aggregate.allowed_fields()
+    assert "publisher" in allowed          # generic column
+    assert "app_category" in allowed       # generic enrichment column
+    assert "key" in allowed
+    assert "app_name" in allowed and "domain" in allowed   # sample adapter DECLARED facets
+    assert "evil_column" not in allowed
 
 
 def test_lookup_requires_filter(fixture_sidecar):

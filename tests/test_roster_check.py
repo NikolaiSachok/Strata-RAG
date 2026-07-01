@@ -16,7 +16,7 @@ from rageval.roster_check import (
     reconcile,
     run,
 )
-from rageval.sidecar import ProjectRecord
+from tests._helpers import make_record
 
 
 # --- normalisation ----------------------------------------------------------
@@ -70,7 +70,7 @@ def test_load_tsv_tolerates_blank_and_short_rows(tmp_path):
 def _rec(source_set, pid, title):
     # roster_check reconciles the TSV's authoritative publisher against the sidecar's doc-inferred
     # app_name (the surface product title), so the sidecar side is set via app_name.
-    return ProjectRecord(project_id=pid, source_set=source_set, app_name=title)
+    return make_record(project_id=pid, source_set=source_set, app_name=title)
 
 
 def _row(pid, publisher, source="northwind"):
