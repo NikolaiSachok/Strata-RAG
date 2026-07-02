@@ -34,6 +34,7 @@ from .pdf import (
 from .tabular import (
     CsvReader,
     TabularData,
+    TabularLimits,
     TabularReader,
     TabularRow,
     XlsxReader,
@@ -51,6 +52,7 @@ __all__ = [
     # spreadsheets (#41)
     "CsvReader",
     "TabularData",
+    "TabularLimits",
     "TabularReader",
     "TabularRow",
     "XlsxReader",

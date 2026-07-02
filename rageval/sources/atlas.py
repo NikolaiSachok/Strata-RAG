@@ -132,9 +132,10 @@ class AtlasAdapter(SourceAdapter):
 
                 # --- .pdf: born-digital PDF text (#39) -------------------------
                 # A PDF yields a SourceDoc like any other document; the extractor carries page
-                # provenance in the text. A NO-TEXT-LAYER (scanned) PDF is flagged in folder_meta so
-                # the manifest surfaces it as a coverage warning (needs OCR) instead of embedding
-                # empty chunks — the scan is NOT silently dropped.
+                # provenance in the text. Detection (MAJOR-2): a FULLY text-less (scanned) PDF is
+                # flagged `pdf_scanned` (manifest coverage warning, needs OCR) — never a silent blind
+                # spot. A PARTIAL doc (some text pages + some image pages) KEEPS its extracted text
+                # and only flags the image pages for OCR; its real text is embedded normally.
                 if ext == _PDF_EXT:
                     try:
                         extraction = self.read_pdf(path)
@@ -144,9 +145,12 @@ class AtlasAdapter(SourceAdapter):
                                 else "spec")
                     meta = {"project_dir": project_dir.name}
                     if extraction.scanned:
-                        # No usable text layer → mark it; discovery still yields the doc (never a
-                        # silent blind spot), the manifest flags it, and no empty chunk is embedded.
+                        # No usable text layer at all → mark it; discovery still yields the doc, the
+                        # manifest flags it, and no empty chunk is embedded (there is no real text).
                         meta["pdf_scanned"] = True
+                    elif extraction.needs_ocr_pages:
+                        # Partial: real text extracted; SOME pages need OCR — flag WITHOUT dropping.
+                        meta["pdf_ocr_pages"] = list(extraction.needs_ocr_pages)
                     docs.append(SourceDoc(
                         project_id=project_id, source_set=self.source_set, doc_path=path,
                         doc_type=doc_type, ext="pdf",

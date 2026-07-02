@@ -34,13 +34,13 @@ from pathlib import Path
 
 # A page whose extracted text is at/below this many non-whitespace chars counts as "no text on
 # this page" (a scanned image page, or a near-blank divider). Small but non-zero so a stray ligature
-# or page number doesn't make a truly scanned page look born-digital.
+# A page needs at LEAST this many non-whitespace chars to count as carrying real text (so a stray
+# ligature or lone page number doesn't make a truly image-only page look born-digital).
 _MIN_PAGE_TEXT_CHARS = 8
 
-# If FEWER than this fraction of pages carry real text, the document is treated as scanned /
-# no-text-layer overall (a coverage warning), rather than silently ingesting a couple of stray
-# glyphs. A born-digital PDF trips well above this; a scanned one sits at ~0.
-_MIN_TEXT_PAGE_FRACTION = 0.2
+# Hard page cap (MAJOR-3, DoS): never walk more than this many pages from one file. A file beyond it
+# is truncated with the truncation surfaced in meta, so a pathological PDF can't pin the CPU.
+_DEFAULT_MAX_PAGES = 2000
 
 
 @dataclass(frozen=True)
@@ -52,28 +52,47 @@ class PdfPage:
 
     @property
     def has_text(self) -> bool:
-        return len(self.text.strip()) > _MIN_PAGE_TEXT_CHARS
+        # >= threshold: a page with exactly _MIN_PAGE_TEXT_CHARS real chars DOES carry text (the old
+        # strict > was an off-by-one that dropped a minimal-but-real page).
+        return len(self.text.strip()) >= _MIN_PAGE_TEXT_CHARS
 
 
 @dataclass(frozen=True)
 class PdfExtraction:
-    """The result of extracting one PDF: its pages + the scanned/no-text-layer verdict.
+    """The result of extracting one PDF: its pages + the text-layer verdict.
+
+    THE KEY DISTINCTION (MAJOR-2): "few text pages" is NOT "no text layer". We NEVER discard a doc
+    that has ANY extractable text — we keep the text pages we got and, if some pages were image-only,
+    flag THOSE pages for OCR without dropping the real text. Only a doc with ZERO text pages is
+    `scanned` (fully image/no-text-layer → the whole doc routes to OCR, and there was no real text to
+    lose).
 
     Fields:
       pages       — one PdfPage per page, in document order (empty text for image-only pages).
-      scanned     — True when the doc has NO usable text layer (see _MIN_TEXT_PAGE_FRACTION):
-                    the caller should FLAG it (coverage warning), NOT embed empty chunks.
+      scanned     — True ONLY when NO page carries a text layer (fully scanned/image PDF). The caller
+                    flags it (coverage warning) and embeds nothing (there is nothing to embed).
+      needs_ocr_pages — page numbers that are image-only in a doc that IS partly text-bearing: a
+                    PARTIAL doc whose real text is still extracted + embedded, with these pages
+                    flagged as an OCR follow-up rather than silently lost.
       backend     — which extractor produced this (auditability; e.g. "pypdf").
     """
 
     pages: tuple[PdfPage, ...]
     scanned: bool
+    needs_ocr_pages: tuple[int, ...] = ()
     backend: str = ""
     meta: dict = field(default_factory=dict)
 
     @property
     def has_text_layer(self) -> bool:
-        return not self.scanned
+        """True if ANY page carries extractable text (a partial doc still has a text layer)."""
+        return self.text_page_count > 0
+
+    @property
+    def partial(self) -> bool:
+        """True for a doc that has BOTH text pages and image-only pages (some OCR follow-up needed,
+        but real text was extracted and must not be dropped)."""
+        return bool(self.needs_ocr_pages) and self.has_text_layer
 
     @property
     def page_count(self) -> int:
@@ -100,31 +119,41 @@ class PdfExtraction:
 
 class PdfExtractor(abc.ABC):
     """The swappable PDF-extraction interface. A backend implements `_read_pages`; the base class
-    owns the corpus-neutral scanned-detection policy so every backend flags scans consistently."""
+    owns the corpus-neutral text-layer detection so every backend classifies consistently."""
 
     #: short, stable backend id recorded on the extraction for auditability.
     name: str = "base"
 
+    #: hard page cap (DoS guard); overridable per subclass/instance.
+    max_pages: int = _DEFAULT_MAX_PAGES
+
     @abc.abstractmethod
-    def _read_pages(self, path: Path) -> list[PdfPage]:
-        """Return one PdfPage per page (image-only pages yield empty text). Backend-specific."""
+    def _read_pages(self, path: Path, *, max_pages: int) -> tuple[list[PdfPage], bool]:
+        """Return (pages, truncated): one PdfPage per page (image-only pages yield empty text), and
+        whether the file had MORE pages than max_pages (truncated). Backend-specific."""
         raise NotImplementedError
 
     def extract(self, path: Path) -> PdfExtraction:
-        """Extract `path` → a PdfExtraction, applying the shared no-text-layer detection.
+        """Extract `path` → a PdfExtraction.
 
-        A PDF that yields zero pages, or too few text-bearing pages (< _MIN_TEXT_PAGE_FRACTION), is
-        marked `scanned=True` so the caller flags it instead of emitting empty chunks."""
-        pages = self._read_pages(Path(path))
+        Detection (MAJOR-2): a doc with NO text-bearing page is `scanned` (fully image → route to
+        OCR; nothing real to lose). A doc with SOME text pages KEEPS its extracted text and flags any
+        image-only pages via `needs_ocr_pages` — its real text is never discarded just because other
+        pages need OCR."""
+        pages, truncated = self._read_pages(Path(path), max_pages=self.max_pages)
         n = len(pages)
         text_pages = sum(1 for p in pages if p.has_text)
-        # No pages at all, or too few carry text → treat as scanned / no-text-layer.
-        scanned = n == 0 or (text_pages / n) < _MIN_TEXT_PAGE_FRACTION
+        scanned = text_pages == 0            # ONLY a fully text-less doc is scanned
+        # In a PARTIAL doc (some text pages), the image-only pages are OCR follow-ups — but we DO NOT
+        # discard the text we extracted. In a fully-scanned doc, every page is trivially "needs OCR",
+        # captured by `scanned` instead (no per-page list needed there).
+        needs_ocr = tuple(p.number for p in pages if not p.has_text) if text_pages else ()
         return PdfExtraction(
             pages=tuple(pages),
             scanned=scanned,
+            needs_ocr_pages=needs_ocr,
             backend=self.name,
-            meta={"page_count": n, "text_page_count": text_pages},
+            meta={"page_count": n, "text_page_count": text_pages, "truncated": truncated},
         )
 
 
@@ -138,7 +167,7 @@ class PypdfExtractor(PdfExtractor):
 
     name = "pypdf"
 
-    def _read_pages(self, path: Path) -> list[PdfPage]:
+    def _read_pages(self, path: Path, *, max_pages: int) -> tuple[list[PdfPage], bool]:
         from pypdf import PdfReader  # lazy: only importable-cost when a PDF is actually read
         from pypdf.errors import PdfReadError
 
@@ -147,15 +176,19 @@ class PypdfExtractor(PdfExtractor):
         except (PdfReadError, OSError, ValueError):
             # A corrupt/unreadable PDF yields NO pages → the base class marks it scanned (flagged),
             # never crashing discovery. (Same tolerance as the .docx path.)
-            return []
+            return [], False
         pages: list[PdfPage] = []
+        truncated = False
         for i, page in enumerate(reader.pages, start=1):
+            if i > max_pages:  # DoS page cap (MAJOR-3): stop and flag truncation.
+                truncated = True
+                break
             try:
                 raw = page.extract_text() or ""
             except Exception:  # noqa: BLE001 — one bad page never kills the whole document
                 raw = ""
             pages.append(PdfPage(number=i, text=_normalize_page_text(raw)))
-        return pages
+        return pages, truncated
 
 
 def _normalize_page_text(raw: str) -> str:
