@@ -34,6 +34,10 @@ openai = ["openai>=2.0,<3.0"]          # for RAGEVAL_EMBEDDINGS=openai
 # bundled): `python -m spacy download en_core_web_sm` (en_core_web_lg for production accuracy).
 pii = ["presidio-analyzer>=2.2,<3.0", "presidio-anonymizer>=2.2,<3.0"]
 ui = ["streamlit>=1.58,<2.0", "requests>=2.32,<3.0"]
+# Local OCR backend (RAGEVAL_OCR_PROVIDER=tesseract). The wrapper + Pillow are opt-in; the
+# system `tesseract` binary is installed SEPARATELY (brew/apt). The seam has NO hard dependency:
+# absent → the tesseract backend degrades to skip-with-reason (the mock/llm backends still work).
+ocr = ["pytesseract>=0.3.10,<0.4", "Pillow>=10.0,<12.0"]
 dev = ["pytest>=9.0,<10.0"]
 
 [project.scripts]
