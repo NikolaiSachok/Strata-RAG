@@ -34,14 +34,15 @@ from pathlib import Path
 from .base import ClassificationPolicy, SourceAdapter, SourceDoc
 from .sample_facts import harvest_facts_for, sample_declared_facets
 from .sample_policy import (
+    atlas_classification_policy,
     docs_txt_doc_type,
     is_metadata_only_file,
     is_store_listing_txt,
-    sample_classification_policy,
 )
 
 _TEXT_EXTS = {".md", ".txt"}
 _DOCX_EXT = ".docx"
+_PDF_EXT = ".pdf"
 _INDEX_EXTS = {".php", ".html", ".htm"}
 
 # A doc counts as a real "description" (which suppresses the index.php fallback) if its
@@ -129,6 +130,33 @@ class AtlasAdapter(SourceAdapter):
                     docs.append(self._mk(project_id, path, doc_type, "docx", text, project_dir))
                     continue
 
+                # --- .pdf: born-digital PDF text (#39) -------------------------
+                # A PDF yields a SourceDoc like any other document; the extractor carries page
+                # provenance in the text. Detection (MAJOR-2): a FULLY text-less (scanned) PDF is
+                # flagged `pdf_scanned` (manifest coverage warning, needs OCR) — never a silent blind
+                # spot. A PARTIAL doc (some text pages + some image pages) KEEPS its extracted text
+                # and only flags the image pages for OCR; its real text is embedded normally.
+                if ext == _PDF_EXT:
+                    try:
+                        extraction = self.read_pdf(path)
+                    except Exception:  # noqa: BLE001 — a corrupt PDF shouldn't crash discovery
+                        continue
+                    doc_type = ("description" if path.stem.lower().startswith("description")
+                                else "spec")
+                    meta = {"project_dir": project_dir.name}
+                    if extraction.scanned:
+                        # No usable text layer at all → mark it; discovery still yields the doc, the
+                        # manifest flags it, and no empty chunk is embedded (there is no real text).
+                        meta["pdf_scanned"] = True
+                    elif extraction.needs_ocr_pages:
+                        # Partial: real text extracted; SOME pages need OCR — flag WITHOUT dropping.
+                        meta["pdf_ocr_pages"] = list(extraction.needs_ocr_pages)
+                    docs.append(SourceDoc(
+                        project_id=project_id, source_set=self.source_set, doc_path=path,
+                        doc_type=doc_type, ext="pdf",
+                        raw_text=extraction.text(), folder_meta=meta))
+                    continue
+
                 # --- plain text candidates -------------------------------------
                 if ext in _TEXT_EXTS:
                     try:
@@ -195,8 +223,8 @@ class AtlasAdapter(SourceAdapter):
         return harvest_facts_for(project_id, project_dir)
 
     def classification_policy(self) -> ClassificationPolicy:
-        """(#37) This corpus's declared allow_ext + file rules (sources/sample_policy)."""
-        return sample_classification_policy()
+        """(#37) This corpus's declared allow_ext (incl. `pdf`, #39) + file rules."""
+        return atlas_classification_policy()
 
     def _mk(self, project_id, path, doc_type, ext, text, project_dir) -> SourceDoc:
         return SourceDoc(

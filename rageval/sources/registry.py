@@ -259,3 +259,22 @@ def discover_all(corpus_root: Path) -> list[SourceDoc]:
     for adapter in get_adapters(corpus_root):
         docs.extend(adapter.discover())
     return docs
+
+
+def harvest_all_entities(corpus_root: Path) -> list:
+    """Run every applicable adapter's `harvest_entities` hook (#41) and collect the STRUCTURED,
+    facts-only entities (spreadsheet rows etc.) across the corpus.
+
+    Parallel to `discover_all`, but for the structured/aggregation path: these entities become
+    their OWN facts-only sidecar records (never embedded). An adapter that has no tabular data
+    overrides nothing → empty. A broken hook degrades to [] for that adapter (never crashes
+    ingest)."""
+    from .base import HarvestedEntity
+
+    entities: list[HarvestedEntity] = []
+    for adapter in get_adapters(corpus_root):
+        try:
+            entities.extend(adapter.harvest_entities())
+        except Exception:  # noqa: BLE001 — a broken tabular harvest never crashes ingest
+            continue
+    return entities

@@ -28,7 +28,7 @@ import argparse
 
 import dataclasses
 
-from .chunking import Chunk, chunk_text
+from .chunking import Chunk, chunk_text_with_pages
 from .classify import CorpusRules, partition
 from .config import SETTINGS, Settings, is_sample_corpus
 from .embeddings import get_embedder
@@ -103,11 +103,15 @@ def _warn_on_corpus_mismatch(existing: set[str], *, ingesting_sample: bool) -> N
 
 
 def build_chunks(included_docs: list[SourceDoc], settings: Settings = SETTINGS) -> list[Chunk]:
-    """Chunk every INCLUDED doc into retrievable units, carrying provenance metadata."""
+    """Chunk every INCLUDED doc into retrievable units, carrying provenance metadata.
+
+    PDF page provenance (MAJOR-1): chunk with `chunk_text_with_pages` so EVERY chunk resolves to the
+    page its content STARTS on (not just a page's first chunk) — the page rides into the payload and
+    out to the citation. Non-PDF docs have no `[page N]` markers, so `page` is None."""
     chunks: list[Chunk] = []
     for d in included_docs:
-        for i, piece in enumerate(chunk_text(d.raw_text, size=settings.chunk_size,
-                                             overlap=settings.chunk_overlap)):
+        for i, (piece, page) in enumerate(chunk_text_with_pages(
+                d.raw_text, size=settings.chunk_size, overlap=settings.chunk_overlap)):
             chunks.append(
                 Chunk(
                     text=piece,
@@ -116,6 +120,7 @@ def build_chunks(included_docs: list[SourceDoc], settings: Settings = SETTINGS) 
                     source=d.doc_path.name,
                     doc_type=d.doc_type,
                     chunk_index=i,
+                    page=page,
                 )
             )
     return chunks
@@ -184,6 +189,11 @@ def ingest(settings: Settings = SETTINGS, *, use_enrich: bool = True,
     conn = connect()
     records = enrich_all(included, chunk_counts, settings, use_llm=use_enrich,
                          on_record=lambda rec: upsert_project(conn, rec))
+    # STRUCTURED, facts-only entities (#41 — spreadsheet rows etc.): a SEPARATE path from the
+    # document enrich loop. Each row becomes its own facts-only sidecar record (chunk_count 0, never
+    # embedded), so an aggregation question over the spreadsheet answers from the sidecar via the
+    # existing `aggregate` path — with NO raw-table dilution of the vector index.
+    n_entities = _ingest_structured_entities(conn, settings)
     conn.close()
 
     return {
@@ -193,9 +203,32 @@ def ingest(settings: Settings = SETTINGS, *, use_enrich: bool = True,
         "secrets_redacted": n_redactions,
         "pii_redacted": n_pii,
         "projects_enriched": len(records),
+        "structured_entities": n_entities,
         "total_in_collection": count(client, settings),
         "collection": settings.collection_name,
     }
+
+
+def _ingest_structured_entities(conn, settings: Settings = SETTINGS) -> int:
+    """Harvest STRUCTURED, facts-only entities (#41) from every adapter's `harvest_entities` hook
+    and write one facts-only sidecar record per entity. Returns the number written.
+
+    Corpus-agnostic: the adapters own the column→facet mapping (the core knows no column names);
+    here we just fold the yielded facts into records (fail-closed against declared facets) and
+    upsert. A corpus with no tabular data yields nothing → a clean no-op. Runs on the MAIN thread
+    (same single SQLite connection as the document enrich writes)."""
+    from .enrich import _log, entities_to_records
+    from .sources import harvest_all_entities
+
+    entities = harvest_all_entities(settings.corpus_root)
+    if not entities:
+        return 0
+    records = entities_to_records(entities)
+    for rec in records:
+        upsert_project(conn, rec)
+    _log(f"[structured] {len(records)} facts-only entities (rows) written to the sidecar "
+         f"(NOT embedded — queryable via aggregate)")
+    return len(records)
 
 
 def enrich_only(settings: Settings = SETTINGS, *, use_enrich: bool = True) -> dict:
@@ -231,11 +264,15 @@ def enrich_only(settings: Settings = SETTINGS, *, use_enrich: bool = True) -> di
     conn = connect()
     records = enrich_all(included, chunk_counts, settings, use_llm=use_enrich,
                          on_record=lambda rec: upsert_project(conn, rec))
+    # Refresh the structured facts-only entities too (spreadsheet rows), so a sidecar refresh is
+    # complete without re-embedding.
+    n_entities = _ingest_structured_entities(conn, settings)
     conn.close()
     return {
         "included_docs": len(included),
         "projects_enriched": len(records),
         "chunks_counted": len(chunks),
+        "structured_entities": n_entities,
     }
 
 
@@ -290,6 +327,7 @@ def main() -> None:
         f"  secrets redacted  : {summary['secrets_redacted']}\n"
         f"  PII redacted      : {summary['pii_redacted']}\n"
         f"  projects enriched : {summary['projects_enriched']}\n"
+        f"  structured rows   : {summary['structured_entities']}\n"
         f"  total in Qdrant   : {summary['total_in_collection']}\n"
         f"  embeddings        : {settings.embeddings} ({settings.embed_model})\n"
         f"  collection        : {summary['collection']}\n"

@@ -93,29 +93,45 @@ class AggregateError(RuntimeError):
     treats this as a signal to FALL BACK to the semantic path, not as a fatal error."""
 
 
+# C0 (U+0000–U+001F except tab/newline) + DEL + C1 (U+007F–U+009F) control characters. Fact VALUES
+# now include spreadsheet cells (untrusted); a raw control byte (ESC `\x1b[…`, BEL) rendered into the
+# answer could corrupt a terminal/log. Strip them so the deterministic render is safe to display.
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
+
+
+def _sanitize_answer(text: str) -> str:
+    """Strip control chars from a rendered aggregation answer (the values may be untrusted cells)."""
+    return _CONTROL_CHARS_RE.sub("", text)
+
+
 def format_aggregation_answer(result: "AggregateResult") -> str:
     """Render a templated-query result into a short human answer string. Kept simple and
     deterministic (no LLM): the structured rows + the routing block carry the real detail.
 
     Public (was dispatch._format_aggregation_answer): both dispatch.py and the agent compose
-    aggregation observations, so it lives here next to AggregateResult — its natural home."""
+    aggregation observations, so it lives here next to AggregateResult — its natural home.
+
+    SECURITY: fact values now include untrusted spreadsheet cells, so the rendered string is
+    control-char-sanitized here (consistently, so dispatch's #16 invariant — answer == renderer
+    output — still holds). Injection/exfil SCANNING of the values happens in dispatch/agent, which
+    populate the GuardrailReport; this function only makes the string safe to serialize."""
     rows = result.rows
     if result.intent == "count":
         n = rows[0].get("count") if rows else 0
-        return f"Count: {n}."
+        return _sanitize_answer(f"Count: {n}.")
     if result.intent in ("group_by_count", "top_n"):
         parts = [f"{r.get(k)}: {r.get('count')}" for r in rows for k in r if k != "count"]
         body = "; ".join(parts) if parts else "no rows"
         label = "Top results" if result.intent == "top_n" else "Grouped counts"
-        return f"{label} — {body}."
+        return _sanitize_answer(f"{label} — {body}.")
     if result.intent == "list":
         # The single non-derived column holds the distinct values.
         vals = [str(next(iter(r.values()))) for r in rows]
-        return "Distinct values: " + (", ".join(vals) if vals else "(none).")
+        return _sanitize_answer("Distinct values: " + (", ".join(vals) if vals else "(none)."))
     if result.intent == "lookup":
         if not rows:
             return "No matching record."
-        return "Record: " + "; ".join(f"{k}={v}" for k, v in rows[0].items())
+        return _sanitize_answer("Record: " + "; ".join(f"{k}={v}" for k, v in rows[0].items()))
     return f"{len(rows)} row(s)."  # pragma: no cover
 
 

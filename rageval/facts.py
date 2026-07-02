@@ -41,6 +41,32 @@ _SECRET_KEY_RE = re.compile(
     re.IGNORECASE,
 )
 
+# --- fact PROVENANCE vocabulary (trust level of a stored value) -------------------------------
+# A fact's provenance records WHERE its value came from, which fixes its TRUST level. This matters
+# for security, not just observability: some downstream defenses (e.g. the agent's exfil-URL
+# allowlist) may only trust a URL that came from an AUTHORITATIVE, corpus-authored descriptor — a
+# URL that arrived through an UNTRUSTED bulk-data channel (a spreadsheet cell an attacker could seed)
+# must NOT be auto-trusted. So the vocabulary is small and explicit, and a helper says which levels
+# are trusted. Tabular rows are their OWN level precisely so they can be excluded from that trust.
+PROVENANCE_DESCRIPTOR = "descriptor"   # an authoritative, corpus-authored descriptor field (trusted)
+PROVENANCE_DERIVED = "derived"         # constructed from a trusted descriptor value (trusted)
+PROVENANCE_TABULAR = "tabular"         # a spreadsheet/CSV ROW cell — bulk data, UNTRUSTED content
+PROVENANCE_CONFIG = "config"           # a config/settings origin (trusted)
+
+# The provenance levels whose values may be TRUSTED as corpus-authored (e.g. a URL from one of these
+# can seed the agent's grounded-URL allowlist). A value from ANY level not in this set — notably
+# `tabular` — is untrusted content and must still trip the output guards.
+_TRUSTED_PROVENANCE: frozenset[str] = frozenset({
+    PROVENANCE_DESCRIPTOR, PROVENANCE_DERIVED, PROVENANCE_CONFIG,
+})
+
+
+def is_trusted_provenance(provenance: str | None) -> bool:
+    """True if a value with this provenance is corpus-AUTHORED (trusted), False for bulk/untrusted
+    channels like `tabular`. An unknown/None provenance is treated as UNTRUSTED (fail-closed)."""
+    return provenance in _TRUSTED_PROVENANCE
+
+
 # Facet value TYPES a corpus may declare. These drive both COERCION (a value is validated/cast to
 # its facet type before storage) and QUERYABILITY (numeric facets support sum/avg; all support
 # count/group_by/list/lookup). Corpus-neutral — an adapter picks the type per facet.
