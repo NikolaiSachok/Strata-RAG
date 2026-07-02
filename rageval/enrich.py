@@ -41,7 +41,7 @@ from . import guardrails as g
 if TYPE_CHECKING:
     from .roster import Roster
 from .config import SETTINGS, Settings
-from .facts import StructuredFact
+from .facts import PROVENANCE_TABULAR, StructuredFact
 from .sidecar import ProjectRecord
 from .sources.base import SourceDoc
 from .sources.registry import adapter_class_for_source_set, all_declared_facets
@@ -245,6 +245,82 @@ def _apply_facts(rec: ProjectRecord, facts: list[StructuredFact]) -> None:
     again at sidecar write."""
     for fact in facts:
         _set_fact(rec, fact.field, fact.value, fact.provenance)
+
+
+def _provenance_suffix(provenance: str) -> str:
+    """A short, filesystem-safe token derived from an entity's provenance (e.g. `loss-run.xlsx:Loss
+    Run#3` → `loss-run.xlsx-Loss_Run-3`), used to DISAMBIGUATE a colliding entity_id so two distinct
+    rows never overwrite each other in the sidecar (CRITICAL-4)."""
+    tok = re.sub(r"[^A-Za-z0-9._-]+", "-", provenance).strip("-")
+    return tok or "row"
+
+
+def entities_to_records(entities: list, chunk_count: int = 0) -> list[ProjectRecord]:
+    """Turn adapter-harvested STRUCTURED entities (#41 — spreadsheet rows etc.) into facts-only
+    ProjectRecords the sidecar can store + `aggregate` can query.
+
+    Each HarvestedEntity becomes ONE record whose project_id is its entity_id, source_set its
+    source_set, chunk_count 0 (never embedded — this is structured data, not narrative), and whose
+    facts are folded in fail-closed against the DECLARED-facet allowlist (an undeclared column is
+    silently dropped — the core knows no column names; the adapter declared which columns are
+    facets). Type coercion happens again at sidecar write, so a mistyped cell degrades that ONE
+    facet, never the batch.
+
+    ROW-COLLISION SAFETY (CRITICAL-4): the sidecar key is `source_set/project_id`, so two rows with
+    the SAME (or empty/None) entity_id would collapse to one record and the second would silently
+    clobber the first — under-reporting counts. We:
+      * REJECT an empty/None entity_id (skip-with-reason; never store `project_id="None"`);
+      * DETECT a duplicate (source_set, entity_id) and DISAMBIGUATE the later row's project_id with a
+        token derived from its unique row PROVENANCE (`file:sheet#row`) — the provenance we now
+        actually USE rather than capture-and-discard — so distinct rows can never collide.
+    Skips + disambiguations are logged so the operator sees them (the harvest path has no dry-run
+    manifest; ingest surfaces the counts).
+
+    This path is DELIBERATELY SEPARATE from the document enrich loop (enrich_all): documents are
+    narrative→embedded; these are structured→aggregated. Keeping them apart means the row-entities
+    never touch the vector index and the document path's behaviour is unchanged."""
+    records: list[ProjectRecord] = []
+    seen_keys: set[tuple[str, str]] = set()
+    skipped = 0
+    disambiguated = 0
+    for ent in entities:
+        entity_id = ent.entity_id
+        # Reject an empty/None id — a facts-only record with no identity can't be cited or de-duped.
+        if entity_id is None or str(entity_id).strip() == "" or str(entity_id) == "None":
+            skipped += 1
+            continue
+        project_id = str(entity_id)
+        key = (ent.source_set, project_id)
+        if key in seen_keys:
+            # A distinct row reusing an id → append the provenance token so the two never collide.
+            suffix = _provenance_suffix(ent.provenance or f"dup{len(records)}")
+            project_id = f"{project_id}#{suffix}"
+            # If STILL colliding (same id AND same provenance), add a counter — never lose a row.
+            n = 2
+            while (ent.source_set, project_id) in seen_keys:
+                project_id = f"{entity_id}#{suffix}-{n}"
+                n += 1
+            disambiguated += 1
+            key = (ent.source_set, project_id)
+        seen_keys.add(key)
+        rec = ProjectRecord(project_id=project_id, source_set=ent.source_set,
+                            chunk_count=chunk_count)
+        for fact in ent.facts:
+            # FAIL-CLOSED PROVENANCE (MAJOR-A): a fact arriving through the tabular row path is
+            # UNTRUSTED bulk content BY DEFINITION — a spreadsheet cell an attacker can seed. We
+            # STAMP `PROVENANCE_TABULAR` here at the boundary, IGNORING whatever the adapter set,
+            # rather than trusting each adapter author to remember it on every StructuredFact (and
+            # rather than inheriting StructuredFact's trusted `descriptor` default, which points the
+            # wrong way for this channel). The boundary KNOWS these are tabular rows (they came from
+            # harvest_entities), so overriding to untrusted is always correct and never harms a
+            # legitimate case — a cell URL can then never reach the trusted grounded-URL allowlist.
+            _set_fact(rec, fact.field, fact.value, PROVENANCE_TABULAR)
+        records.append(rec)
+    if skipped or disambiguated:
+        _log(f"[structured] {len(records)} row-entities "
+             f"({disambiguated} id-collisions disambiguated by provenance, "
+             f"{skipped} skipped for empty id)")
+    return records
 
 
 def _parse_json(raw: str) -> dict:

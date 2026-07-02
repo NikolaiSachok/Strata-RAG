@@ -440,6 +440,31 @@ class ChatAgent:
         self.pipeline = pipeline
         self.llm = llm if llm is not None else getattr(pipeline, "llm", None)
         self.max_tool_calls = max_tool_calls
+        self._trusted_urls_cache: set[str] | None = None
+
+    def _trusted_urls(self) -> set[str]:
+        """URLs stored in TRUSTED-provenance facts (descriptor/derived/config) — the only fact URLs
+        allowed to seed the grounded-URL allowlist (CRITICAL-2). A URL that lives ONLY in an
+        untrusted `tabular` cell is NOT here, so an exfil URL planted in a spreadsheet still trips
+        the exfil check. Computed once per agent (read-only sidecar), tolerant of a missing DB."""
+        if self._trusted_urls_cache is None:
+            import sqlite3
+
+            from . import aggregate  # read the SAME sidecar path the metadata tool resolves against
+            from .sidecar import trusted_fact_urls
+
+            urls: set[str] = set()
+            try:
+                conn = sqlite3.connect(f"file:{aggregate.SIDECAR_PATH}?mode=ro", uri=True)
+                conn.row_factory = sqlite3.Row
+                try:
+                    urls = trusted_fact_urls(conn)
+                finally:
+                    conn.close()
+            except (sqlite3.Error, OSError):
+                urls = set()  # no sidecar yet → trust nothing (fail-closed)
+            self._trusted_urls_cache = urls
+        return self._trusted_urls_cache
 
     # -- prompt assembly ----------------------------------------------------
 
@@ -693,9 +718,12 @@ class ChatAgent:
         # protects the metadata channel. We pass no doc_type → the default (non-public) policy
         # redacts personal emails while role/published contacts pass through, identical to ingest.
         obs, _n_sec, _n_pii = redact(obs)
-        # #7: a lookup/SELECT * can surface a URL stored in corpus metadata — count it as grounded.
-        # (Done AFTER redaction so a redacted credential/email can't seed the allowed-URL set.)
-        grounded_urls |= g._urls_in(obs)
+        # #7 + CRITICAL-2: a lookup/SELECT * can surface a URL stored in corpus metadata. Count it as
+        # grounded ONLY if it comes from a TRUSTED-provenance fact (descriptor/derived/config) — NOT
+        # from an untrusted `tabular` cell an attacker could plant. We intersect the observation's
+        # URLs with the trusted-fact URL set, so a spreadsheet-planted exfil URL is NEVER whitelisted
+        # and still trips the output exfil check. (After redaction, so a redacted value can't seed it.)
+        grounded_urls |= (g._urls_in(obs) & self._trusted_urls())
         return obs, err is None
 
     def _compose_final(self, question: str, history: list[Turn], scratch: list[str],

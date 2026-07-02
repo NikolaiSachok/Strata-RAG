@@ -18,7 +18,14 @@ and to unit-test (it's pure: text in, chunks out).
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
+
+# A page-provenance marker the PDF extractor inserts at each page boundary: `[page N]`.
+# Chunking splits it away from a page's later chunks, so we track marker OFFSETS and resolve each
+# chunk's page from the last marker at-or-before its start (MAJOR-1). Kept in sync with
+# extract/pdf.py's PdfExtraction.text().
+_PAGE_MARKER_RE = re.compile(r"\[page (\d+)\]")
 
 
 @dataclass(frozen=True)
@@ -35,6 +42,7 @@ class Chunk:
     source: str        # filename, e.g. "description.docx"
     doc_type: str
     chunk_index: int   # 0-based position within the source document
+    page: int | None = None  # 1-based PDF page this chunk's content STARTS on (None for non-PDF)
 
     @property
     def id(self) -> str:
@@ -60,3 +68,59 @@ def chunk_text(text: str, *, size: int, overlap: int) -> list[str]:
             pieces.append(piece)
         start += step
     return pieces
+
+
+def _page_offsets(text: str) -> list[tuple[int, int]]:
+    """Return sorted (char_offset, page_number) for every `[page N]` marker in `text`."""
+    return [(m.start(), int(m.group(1))) for m in _PAGE_MARKER_RE.finditer(text)]
+
+
+def _page_at(offset: int, markers: list[tuple[int, int]]) -> int | None:
+    """The page a window STARTING at `offset` belongs to: the last marker at-or-before it.
+    None when no marker precedes the offset (non-PDF text, or content before the first marker)."""
+    page = None
+    for pos, num in markers:
+        if pos <= offset:
+            page = num
+        else:
+            break
+    return page
+
+
+def chunk_text_with_pages(text: str, *, size: int, overlap: int) -> list[tuple[str, int | None]]:
+    """Like `chunk_text`, but each chunk is paired with the PDF PAGE its content starts on (MAJOR-1).
+
+    The char-window chunker splits a page's `[page N]` marker away from that page's later chunks, so
+    the marker alone can't attribute every chunk. We resolve each window's page from the marker
+    OFFSETS (the last marker at-or-before the window start) and, when the window doesn't itself begin
+    with a marker, PREPEND the resolved `[page N]` so the provenance is visible in the chunk text AND
+    in the returned page field. A boundary-spanning window is attributed to the page it STARTS on
+    (the correct default — its head content is that page's), never mis-attributed to the next page.
+
+    Returns [] for empty text. Operates on the SAME stripped text `chunk_text` uses, so offsets line
+    up with the produced windows.
+    """
+    if size <= 0:
+        raise ValueError("chunk size must be positive")
+    if overlap >= size:
+        raise ValueError("overlap must be smaller than chunk size")
+    cleaned = text.strip()
+    if not cleaned:
+        return []
+    markers = _page_offsets(cleaned)
+    out: list[tuple[str, int | None]] = []
+    start = 0
+    step = size - overlap
+    while start < len(cleaned):
+        window = cleaned[start : start + size]
+        page = _page_at(start, markers)
+        piece = window.strip()
+        if piece:
+            # If this window doesn't already open with a marker for its page, prepend it so the
+            # citation is legible in the chunk itself (retrieval shows chunk text). Only when we
+            # actually resolved a page (PDF content).
+            if page is not None and not _PAGE_MARKER_RE.match(piece):
+                piece = f"[page {page}]\n{piece}"
+            out.append((piece, page))
+        start += step
+    return out

@@ -104,6 +104,7 @@ def upsert_chunks(client: QdrantClient, chunks: list[Chunk],
                     "source": c.source,
                     "doc_type": c.doc_type,
                     "chunk_index": c.chunk_index,
+                    "page": c.page,          # PDF page provenance (None for non-PDF chunks)
                     "text": c.text,
                 },
             )
@@ -131,6 +132,7 @@ class DenseHit:
     doc_type: str
     chunk_index: int
     score: float  # cosine similarity in [0, 1]
+    page: int | None = None  # PDF page provenance (None for non-PDF chunks)
 
 
 def dense_search(client: QdrantClient, query_vector: list[float], *, limit: int,
@@ -167,6 +169,7 @@ def dense_search(client: QdrantClient, query_vector: list[float], *, limit: int,
                 doc_type=str(pl.get("doc_type", "")),
                 chunk_index=int(pl.get("chunk_index", -1)),
                 score=float(p.score),  # cosine distance config → score is similarity
+                page=(int(pl["page"]) if pl.get("page") is not None else None),
             )
         )
     return hits

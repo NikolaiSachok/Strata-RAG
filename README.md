@@ -3,8 +3,9 @@
 **🌐 [Project site](https://nikolaisachok.github.io/Strata-RAG/) · 📖 [Wiki](https://github.com/NikolaiSachok/Strata-RAG/wiki) · [Architecture](https://github.com/NikolaiSachok/Strata-RAG/wiki/Architecture) · [Design-Decisions](https://github.com/NikolaiSachok/Strata-RAG/wiki/Design-Decisions) · [Evaluation](https://github.com/NikolaiSachok/Strata-RAG/wiki/Evaluation) · [Red-Teaming](https://github.com/NikolaiSachok/Strata-RAG/wiki/Red-Teaming)**
 
 A **heavily-commented, study-grade** Retrieval-Augmented Generation engine that indexes a
-**heterogeneous, multi-format document corpus** (a project archive of `.md` / `.txt` / `.docx`
-specs, descriptions, config, and promo copy) and answers questions over it — built to be
+**heterogeneous, multi-format document corpus** (`.md` / `.txt` / `.docx` / born-digital `.pdf`
+specs, descriptions, config, promo copy — plus `.xlsx` / `.csv` spreadsheets read as structured
+facts) and answers questions over it — built to be
 *read as a tutorial on production RAG*, not just used.
 
 It assembles the pieces a real document-intelligence system needs: **pluggable source adapters**,
@@ -74,8 +75,9 @@ indexed engine
 
 | File | What it teaches |
 |------|-----------------|
-| `sources/base.py` | The **`SourceDoc` + `SourceAdapter`** seam — how to make ingest **corpus-agnostic** so a new corpus = a new adapter, nothing else. |
-| `sources/northwind.py`, `sources/atlas.py` | Two concrete adapters for two corpus shapes; the Atlas one parses **legacy `.docx`** (python-docx). A new corpus shape = a new adapter + one `register_adapter(...)` call. |
+| `sources/base.py` | The **`SourceDoc` + `SourceAdapter`** seam — how to make ingest **corpus-agnostic** so a new corpus = a new adapter, nothing else. Also the **`HarvestedEntity`** seam (structured, facts-only rows). |
+| `sources/northwind.py`, `sources/atlas.py` | Two concrete adapters for two corpus shapes; the Atlas one parses **legacy `.docx`** (python-docx) **and born-digital `.pdf`** (via `extract/`). A new corpus shape = a new adapter + one `register_adapter(...)` call. |
+| `extract/pdf.py`, `extract/tabular.py` | **Multi-format extraction** behind swappable interfaces: born-digital **PDF** text with **page provenance** + **no-text-layer (scanned) detection** (pypdf); **spreadsheets** (xlsx/csv) parsed to structured rows. The design point — a **PDF is narrative → embedded**, a **spreadsheet is structured data → sidecar facts** (never embedded prose, so it can't dilute top-k **and** an aggregation question answers deterministically). The column→facet mapping lives in the **adapter**, not the core. |
 | `corpus-rules.yaml` + `classify.py` | **Tiered relevance classification**: deterministic rules (Tier 1, the trusted artifact) + an **LLM advisor that PROPOSES rule changes** relative to a `corpus_intent` (Tier 2, human-approved). |
 | `manifest.py` | **Ingestion observability**: the `--dry-run` include/exclude-with-reason + coverage (blind-spot/outlier) manifest *before* embedding. |
 | `inspect.py` | The post-ingest **chunk browser** + coverage + sidecar audit + quality flags. |

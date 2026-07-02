@@ -21,14 +21,16 @@ from __future__ import annotations
 
 from ..query_classes import QueryClass, register_query_class
 from ..roster import register_family
-from .base import ClassificationPolicy, FileRule, SourceAdapter, SourceDoc
-from .registry import discover_all, get_adapters, register_adapter
+from .base import ClassificationPolicy, FileRule, HarvestedEntity, SourceAdapter, SourceDoc
+from .registry import discover_all, get_adapters, harvest_all_entities, register_adapter
 
 __all__ = [
     "SourceAdapter",
     "SourceDoc",
+    "HarvestedEntity",
     "ClassificationPolicy",
     "FileRule",
+    "harvest_all_entities",
     "QueryClass",
     "discover_all",
     "get_adapters",

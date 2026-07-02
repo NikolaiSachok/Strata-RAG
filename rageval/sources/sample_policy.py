@@ -109,3 +109,17 @@ def sample_classification_policy() -> ClassificationPolicy:
         allow_ext=frozenset({"md", "txt", "docx", "php", "html", "htm"}),
         file_rules=(),
     )
+
+
+def atlas_classification_policy() -> ClassificationPolicy:
+    """The atlas (multi-format, legacy-heavy) corpus's policy — the sample policy PLUS `pdf`.
+
+    Only the atlas adapter reads born-digital PDFs (#39), so `pdf` is declared HERE, per-corpus,
+    rather than in the shared baseline: adding a format for the multi-format corpus can never
+    silently change how another corpus (northwind) classifies. The bundled sample data ships no
+    PDFs, so this is inert for the sample and exercised by the PDF fixture tests + real corpora."""
+    base = sample_classification_policy()
+    return ClassificationPolicy(
+        allow_ext=base.allow_ext | frozenset({"pdf"}),
+        file_rules=base.file_rules,
+    )

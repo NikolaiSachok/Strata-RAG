@@ -276,6 +276,25 @@ def project_facts(conn: sqlite3.Connection, key: str) -> dict:
     return out
 
 
+def trusted_fact_urls(conn: sqlite3.Connection) -> set[str]:
+    """Every http(s) URL stored in a fact whose PROVENANCE is TRUSTED (corpus-authored descriptor/
+    derived/config) — NOT a value from an untrusted bulk channel like `tabular`.
+
+    WHY (CRITICAL-2): the agent may treat a URL from a legitimate descriptor as 'grounded' so a
+    metadata-only turn doesn't false-flag it as exfil. But a URL sitting in a SPREADSHEET CELL is
+    attacker-plantable content — it must stay UNtrusted so the exfil backstop still trips. This
+    function returns ONLY the trusted URLs, so the agent's grounded-URL allowlist can be gated on
+    provenance. Values are scanned for URLs with the same extractor the guardrails use."""
+    from . import guardrails as g
+    from .facts import is_trusted_provenance
+
+    urls: set[str] = set()
+    for r in conn.execute("SELECT value, provenance FROM project_facts"):
+        if is_trusted_provenance(r["provenance"]):
+            urls |= g._urls_in(r["value"] or "")
+    return urls
+
+
 def _decode_fact(value: str | None, value_type: str) -> object:
     if value is None:
         return None
