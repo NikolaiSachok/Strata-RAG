@@ -172,6 +172,22 @@ class Settings:
     llm_backend: str  # "auto" | "api" | "cli"
     model: str        # Anthropic model id used for generation, judging, enrichment.
 
+    # --- Multimodal provider seams (Phase 1.5; see vision.py / ocr.py) ------
+    # PLUGGABLE backends for the two image→text tasks, selected by name from a registry.
+    # Both default to a real backend where feasible and degrade gracefully (skip-with-reason,
+    # never crash) when that backend is absent/misconfigured — the same failure model as
+    # enrichment. A deterministic "mock" backend covers CI so no test needs a live model.
+    #   vision_provider — describe/caption an image. "claude" (default, via the llm.py API path),
+    #                     "mock" (CI), or any registered backend (another cloud LLM / local VLM).
+    #   ocr_provider    — image→text OCR. "tesseract" (default where the binary+pytesseract are
+    #                     present; degrades if absent), "llm" (reuse the vision provider as OCR),
+    #                     "mock" (CI), or any registered backend (cloud OCR / local VLM).
+    # The chosen provider is recorded in any output payload for auditability. NO hard import
+    # dependency on a cloud SDK or Tesseract — backends lazy-import their libs (vision.py/ocr.py).
+    vision_provider: str  # "claude" | "mock" | <registered name>
+    ocr_provider: str     # "tesseract" | "llm" | "mock" | <registered name>
+    vision_model: str     # model id for the Claude vision backend (defaults to `model`)
+
     # --- Enrichment concurrency --------------------------------------------
     # The enrichment pass makes ONE blocking LLM call per project (~50s each on the `claude`
     # CLI). Sequentially over a large corpus (hundreds of projects) that's hours. The calls are
@@ -278,6 +294,11 @@ class Settings:
             roster_dir=_env("RAGEVAL_ROSTER_DIR", ""),
             llm_backend=_env("RAGEVAL_LLM_BACKEND", "auto").lower(),
             model=_env("RAGEVAL_MODEL", "claude-opus-4-8"),
+            vision_provider=_env("RAGEVAL_VISION_PROVIDER", "claude").lower(),
+            ocr_provider=_env("RAGEVAL_OCR_PROVIDER", "tesseract").lower(),
+            # Empty → fall back to `model` (resolved in vision.py). A separate knob lets you pin a
+            # cheaper/faster vision model without changing the generation/judge model.
+            vision_model=_env("RAGEVAL_VISION_MODEL", ""),
             enrich_concurrency=max(1, _env_int("RAGEVAL_ENRICH_CONCURRENCY", 8)),
             pii_backend=_env("RAGEVAL_PII_BACKEND", "regex").lower(),
             pii_spacy_model=_env("RAGEVAL_PII_SPACY_MODEL", "en_core_web_sm"),
