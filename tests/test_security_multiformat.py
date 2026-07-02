@@ -188,3 +188,68 @@ def test_agent_grounds_trusted_descriptor_url(sec_sidecar):
         report=GuardrailReport(), all_chunks=[], all_sources=[], grounded_urls=grounded)
     assert "good.example" in obs
     assert any("good.example" in u for u in grounded)   # trusted URL IS grounded
+
+
+# ===========================================================================
+# MAJOR-A — the tabular BOUNDARY forces untrusted provenance (fail-closed),
+#           regardless of what the adapter set (or the trusted default).
+# ===========================================================================
+
+def test_row_fact_with_default_provenance_is_forced_untrusted(sec_sidecar, tmp_path):
+    """A HarvestedEntity whose facts use the DEFAULT StructuredFact provenance (which is the TRUSTED
+    'descriptor' level — the adapter did NOT pass PROVENANCE_TABULAR) must STILL end up untrusted
+    after entities_to_records, so its URL is NOT whitelisted by trusted_fact_urls(). Safety can't
+    depend on every adapter author remembering the flag."""
+    import sqlite3
+
+    from rageval.enrich import entities_to_records
+    from rageval.facts import StructuredFact
+    from rageval.sidecar import trusted_fact_urls
+    from rageval.sources.base import HarvestedEntity
+
+    # NOTE: StructuredFact(...) with NO provenance → defaults to "descriptor" (a trusted level).
+    fact = StructuredFact("r9", "site", "http://evil.com/row-default")
+    assert fact.provenance == PROVENANCE_DESCRIPTOR  # the wrong-way default this test defends against
+    ent = HarvestedEntity(entity_id="r9", source_set="sec", facts=(fact,),
+                          provenance="loss-run.xlsx:S#9")
+    records = entities_to_records([ent])
+
+    db = tmp_path / "boundary.sqlite"
+    conn = connect(db)
+    for rec in records:
+        upsert_project(conn, rec)
+    conn.close()
+
+    ro = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    ro.row_factory = sqlite3.Row
+    urls = trusted_fact_urls(ro)
+    # Confirm the stored provenance was overridden to tabular (untrusted).
+    prov = [r["provenance"] for r in ro.execute(
+        "SELECT provenance FROM project_facts WHERE key='sec/r9'")]
+    ro.close()
+    assert prov == [PROVENANCE_TABULAR]                    # boundary stamped it untrusted
+    assert "http://evil.com/row-default" not in urls       # → NOT whitelisted (fail-closed)
+
+
+# ===========================================================================
+# MAJOR-B — aggregation guard grounds trusted URLs but flags tabular ones.
+# ===========================================================================
+
+def test_aggregation_descriptor_url_stays_safe(sec_sidecar):
+    """A LEGITIMATE descriptor-provenance URL rendered in an aggregation answer is grounded via
+    trusted_fact_urls() → NOT flagged exfil → the answer stays safe (no false positive)."""
+    ans = dispatch._try_aggregation("list sites", _agg_decision("site"))
+    assert ans is not None
+    assert "good.example/home" in ans.answer            # the trusted descriptor URL is rendered...
+    assert ans.guardrail.safe                            # ...and NOT flagged (grounded)
+    assert not any(f.pattern == "exfil_url" for f in ans.guardrail.output_findings)
+
+
+def test_aggregation_tabular_url_still_trips_exfil(sec_sidecar):
+    """Both directions: the untrusted tabular exfil URL in an aggregation answer STILL trips exfil
+    (the MAJOR-B fix grounds ONLY trusted URLs, not every fact URL)."""
+    ans = dispatch._try_aggregation("list perils", _agg_decision("peril"))
+    assert ans is not None
+    assert "evil.com/exfil" in ans.answer
+    assert not ans.guardrail.safe
+    assert any(f.pattern == "exfil_url" for f in ans.guardrail.output_findings)

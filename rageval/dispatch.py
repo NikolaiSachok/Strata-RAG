@@ -109,6 +109,27 @@ def _try_aggregation(question: str, decision: RouteDecision) -> Answer | None:
     )
 
 
+def _trusted_agg_urls() -> list[str]:
+    """URLs stored in TRUSTED-provenance facts (descriptor/derived/config) — the allowed-URL context
+    for the aggregation guard (MAJOR-B). Read READ-ONLY from the SAME sidecar the aggregation query
+    resolved against (aggregate.SIDECAR_PATH), tolerant of a missing DB. A URL from an UNTRUSTED
+    `tabular` cell is NOT here, so a legit descriptor URL in an aggregation answer isn't false-flagged
+    while a cell-planted exfil URL still trips exfil."""
+    import sqlite3
+
+    from .sidecar import trusted_fact_urls
+
+    try:
+        conn = sqlite3.connect(f"file:{aggregate.SIDECAR_PATH}?mode=ro", uri=True)
+        conn.row_factory = sqlite3.Row
+        try:
+            return sorted(trusted_fact_urls(conn))
+        finally:
+            conn.close()
+    except (sqlite3.Error, OSError):
+        return []  # no sidecar → trust nothing (fail-closed)
+
+
 def _aggregation_guardrail(answer_text: str, result: aggregate.AggregateResult) -> g.GuardrailReport:
     """Run the guardrails over an aggregation answer (CRITICAL-1).
 
@@ -119,8 +140,10 @@ def _aggregation_guardrail(answer_text: str, result: aggregate.AggregateResult) 
 
     We:
       * INPUT-scan every rendered fact/row value for injection payloads (recorded as input findings);
-      * OUTPUT-validate the rendered answer with `validate_answer` — with NO allowed_sources and NO
-        chunks, so ANY URL in the answer is novel → an exfil finding (a cell-planted URL is caught).
+      * OUTPUT-validate the rendered answer with `validate_answer`, allowing ONLY trusted-provenance
+        fact URLs (MAJOR-B): a legitimate descriptor URL rendered in the answer is grounded (not
+        false-flagged), while a URL that reached the answer from an UNTRUSTED tabular cell is novel →
+        an exfil finding. This mirrors the /chat agent's provenance-gated grounding on the /ask path.
     The populated report drives `safe`, so a poisoned aggregation answer no longer reads as safe."""
     report = g.GuardrailReport(layers={"input_scan": True, "output_validate": True})
     # INPUT: scan each raw cell value the render exposed (values are untrusted since #41).
@@ -131,9 +154,10 @@ def _aggregation_guardrail(answer_text: str, result: aggregate.AggregateResult) 
                     g.scan_for_injection(value, where="sidecar_fact"))
     # Also scan the composed answer text itself (belt-and-braces for injection phrasing).
     report.input_findings.extend(g.scan_for_injection(answer_text, where="aggregation_answer"))
-    # OUTPUT: exfil / fake-citation / prompt-leak over the rendered answer. chunks=[] and no
-    # allowed_sources → a URL that reached the answer from a fact value is novel → flagged.
-    report.output_findings.extend(g.validate_answer(answer_text, [], allowed_sources=None))
+    # OUTPUT: exfil / fake-citation / prompt-leak. allowed_sources = ONLY trusted-provenance fact
+    # URLs, so a descriptor URL is grounded but a tabular-cell URL is still flagged exfil.
+    report.output_findings.extend(
+        g.validate_answer(answer_text, [], allowed_sources=_trusted_agg_urls()))
     return report
 
 

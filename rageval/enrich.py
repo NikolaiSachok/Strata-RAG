@@ -41,7 +41,7 @@ from . import guardrails as g
 if TYPE_CHECKING:
     from .roster import Roster
 from .config import SETTINGS, Settings
-from .facts import StructuredFact
+from .facts import PROVENANCE_TABULAR, StructuredFact
 from .sidecar import ProjectRecord
 from .sources.base import SourceDoc
 from .sources.registry import adapter_class_for_source_set, all_declared_facets
@@ -306,7 +306,15 @@ def entities_to_records(entities: list, chunk_count: int = 0) -> list[ProjectRec
         rec = ProjectRecord(project_id=project_id, source_set=ent.source_set,
                             chunk_count=chunk_count)
         for fact in ent.facts:
-            _set_fact(rec, fact.field, fact.value, fact.provenance)
+            # FAIL-CLOSED PROVENANCE (MAJOR-A): a fact arriving through the tabular row path is
+            # UNTRUSTED bulk content BY DEFINITION — a spreadsheet cell an attacker can seed. We
+            # STAMP `PROVENANCE_TABULAR` here at the boundary, IGNORING whatever the adapter set,
+            # rather than trusting each adapter author to remember it on every StructuredFact (and
+            # rather than inheriting StructuredFact's trusted `descriptor` default, which points the
+            # wrong way for this channel). The boundary KNOWS these are tabular rows (they came from
+            # harvest_entities), so overriding to untrusted is always correct and never harms a
+            # legitimate case — a cell URL can then never reach the trusted grounded-URL allowlist.
+            _set_fact(rec, fact.field, fact.value, PROVENANCE_TABULAR)
         records.append(rec)
     if skipped or disambiguated:
         _log(f"[structured] {len(records)} row-entities "
