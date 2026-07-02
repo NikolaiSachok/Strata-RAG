@@ -87,15 +87,24 @@ class HarvestedEntity:
       question over a spreadsheet answer deterministically from the sidecar.
 
     Fields:
-      entity_id   — a stable, per-corpus-UNIQUE id for this row/record (e.g. a claim id, or
-                    "<file-stem>-r<row>"). Becomes the sidecar record's project_id, so it MUST be
-                    unique within the source_set or two rows collapse onto one key.
+      entity_id   — a stable id for this row/record (e.g. a claim id). Becomes the sidecar record's
+                    project_id. It SHOULD be unique within the source_set; if two rows collide (or an
+                    id is empty), ingest disambiguates using `provenance` / skips it (CRITICAL-4) —
+                    so a duplicate/blank id can never silently overwrite another row's facts.
       source_set  — which source-set/family this entity belongs to (the sidecar record's source_set).
       facts       — the StructuredFacts for this entity (each names a DECLARED facet; stored
                     fail-closed). The column→facet MAPPING is the adapter's business — the core
                     carries no column names.
-      provenance  — where it came from, kept generic + human-readable (e.g. "loss-run.xlsx:Loss Run#3"
-                    — file/sheet/row), retained for auditability.
+
+                    PROVENANCE CONVENTION (security): a fact lifted from a SPREADSHEET CELL is
+                    UNTRUSTED bulk content (an attacker can seed a cell), so its StructuredFact
+                    provenance SHOULD be `facts.PROVENANCE_TABULAR` — NOT `descriptor`. Downstream
+                    trust decisions (e.g. the agent's grounded-URL allowlist) only trust
+                    descriptor/derived/config provenance, so a URL planted in a cell is never
+                    auto-trusted and still trips the exfil guard.
+      provenance  — where the ENTITY came from, human-readable (e.g. "loss-run.xlsx:Loss Run#3" —
+                    file/sheet/row). Retained for auditability AND used to disambiguate a colliding
+                    entity_id so distinct rows never collapse onto one sidecar key.
     """
 
     entity_id: str

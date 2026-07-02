@@ -24,6 +24,7 @@ to the semantic retriever, labelled as a basic two-step. The richer agentic deco
 from __future__ import annotations
 
 from . import aggregate
+from . import guardrails as g
 from . import query_classes as qc
 from . import router as router_mod
 from .generate import Answer, RagPipeline
@@ -97,13 +98,43 @@ def _try_aggregation(question: str, decision: RouteDecision) -> Answer | None:
         "aggregation/lookup answer text must be the deterministic renderer output; the "
         "faithfulness-skip in eval.py depends on it (issue #16)."
     )
+    report = _aggregation_guardrail(answer_text, result)
     return Answer(
         question=question,
         answer=answer_text,
         sources=[],          # aggregation answers cite the sidecar, not document chunks
         chunks=[],
+        guardrail=report,
         routing=_routing_block(decision, result=result, executed_route=decision.route),
     )
+
+
+def _aggregation_guardrail(answer_text: str, result: aggregate.AggregateResult) -> g.GuardrailReport:
+    """Run the guardrails over an aggregation answer (CRITICAL-1).
+
+    The sidecar is now an UNTRUSTED-CONTENT channel: spreadsheet cells populate fact values that the
+    deterministic renderer surfaces VERBATIM. So the aggregation path must get the SAME treatment as
+    the semantic/agent paths — it previously returned a DEFAULT-empty report with `safe==True` even
+    when a cell carried an exfil URL, a markdown-image beacon, or an injection string.
+
+    We:
+      * INPUT-scan every rendered fact/row value for injection payloads (recorded as input findings);
+      * OUTPUT-validate the rendered answer with `validate_answer` — with NO allowed_sources and NO
+        chunks, so ANY URL in the answer is novel → an exfil finding (a cell-planted URL is caught).
+    The populated report drives `safe`, so a poisoned aggregation answer no longer reads as safe."""
+    report = g.GuardrailReport(layers={"input_scan": True, "output_validate": True})
+    # INPUT: scan each raw cell value the render exposed (values are untrusted since #41).
+    for row in result.rows:
+        for value in row.values():
+            if isinstance(value, str) and value:
+                report.input_findings.extend(
+                    g.scan_for_injection(value, where="sidecar_fact"))
+    # Also scan the composed answer text itself (belt-and-braces for injection phrasing).
+    report.input_findings.extend(g.scan_for_injection(answer_text, where="aggregation_answer"))
+    # OUTPUT: exfil / fake-citation / prompt-leak over the rendered answer. chunks=[] and no
+    # allowed_sources → a URL that reached the answer from a fact value is novel → flagged.
+    report.output_findings.extend(g.validate_answer(answer_text, [], allowed_sources=None))
+    return report
 
 
 def dispatch(question: str, pipeline: RagPipeline, *,

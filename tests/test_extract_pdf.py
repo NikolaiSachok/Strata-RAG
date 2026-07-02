@@ -104,24 +104,29 @@ def test_no_text_layer_pdf_detected_not_silently_empty(tmp_path):
     assert ex.text().strip() == ""
 
 
-def test_mostly_scanned_pdf_flagged(tmp_path):
-    """A doc that is overwhelmingly image pages with a single stray text page is still flagged
-    scanned (below the text-page fraction threshold) — the honest verdict for an OCR-needed doc."""
+def test_sparse_but_real_pdf_keeps_its_text(tmp_path):
+    """MAJOR-2: a doc with mostly image pages but a REAL text page is NOT scanned — its text is kept
+    and the image pages are flagged for OCR, never discarded. "Few text pages" != "no text layer"."""
     from pypdf import PdfReader, PdfWriter
 
     born = tmp_path / "one.pdf"
-    _born_digital_pdf(born, ["just one real page of text here"])
+    _born_digital_pdf(born, ["just one real page of text here that must survive"])
     w = PdfWriter()
     w.append(PdfReader(str(born)))
     for _ in range(9):
-        w.add_blank_page(width=612, height=792)  # 1 text page out of 10 → below threshold
+        w.add_blank_page(width=612, height=792)  # 1 text page + 9 image pages
     mixed = tmp_path / "mixed.pdf"
     with open(mixed, "wb") as fh:
         w.write(fh)
 
     ex = extract_pdf(mixed)
     assert ex.page_count == 10 and ex.text_page_count == 1
-    assert ex.scanned is True  # 1/10 < 0.2 → scanned
+    assert ex.scanned is False                 # has a text layer → NOT scanned
+    assert ex.has_text_layer is True
+    assert ex.partial is True                  # some pages still need OCR
+    assert "must survive" in ex.text()         # the real text is NOT dropped
+    # The 9 image pages are flagged for an OCR follow-up (not silently lost).
+    assert ex.needs_ocr_pages == tuple(range(2, 11))
 
 
 # --- pluggability + robustness --------------------------------------------------------------
@@ -132,13 +137,33 @@ def test_extractor_is_pluggable(tmp_path):
     class StubExtractor(PdfExtractor):
         name = "stub"
 
-        def _read_pages(self, path):
-            return [PdfPage(1, "stub page one has plenty of text"),
-                    PdfPage(2, "stub page two also has text content")]
+        def _read_pages(self, path, *, max_pages):
+            return ([PdfPage(1, "stub page one has plenty of text"),
+                     PdfPage(2, "stub page two also has text content")], False)
 
     ex = extract_pdf(tmp_path / "ignored.pdf", extractor=StubExtractor())
     assert ex.backend == "stub" and not ex.scanned
     assert "stub page one" in ex.text()
+
+
+def test_pdf_page_cap_truncates_and_flags(tmp_path):
+    """MAJOR-3: an over-cap PDF is truncated at max_pages with truncation recorded (DoS guard)."""
+
+    class ManyPages(PdfExtractor):
+        name = "many"
+        max_pages = 3
+
+        def _read_pages(self, path, *, max_pages):
+            pages, truncated = [], False
+            for i in range(1, 11):
+                if i > max_pages:
+                    truncated = True
+                    break
+                pages.append(PdfPage(i, f"page {i} content text here"))
+            return pages, truncated
+
+    ex = extract_pdf(tmp_path / "big.pdf", extractor=ManyPages())
+    assert ex.page_count == 3 and ex.meta["truncated"] is True
 
 
 def test_corrupt_pdf_degrades_to_scanned(tmp_path):

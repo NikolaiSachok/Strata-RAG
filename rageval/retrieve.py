@@ -45,6 +45,7 @@ class Retrieved:
     dense_rank: int | None = None      # 1-based rank in the dense list (None if absent)
     sparse_rank: int | None = None     # 1-based rank in the BM25 list (None if absent)
     rerank_score: float = field(default=0.0)
+    page: int | None = None            # PDF page provenance (None for non-PDF chunks)
 
 
 class CollectionMissingError(RuntimeError):
@@ -238,6 +239,7 @@ class Retriever:
                     score=float(score),
                     dense_rank=dense_pos.get(cid),
                     sparse_rank=sparse_pos.get(cid),
+                    page=(int(pl["page"]) if pl.get("page") is not None else None),
                 )
             )
 

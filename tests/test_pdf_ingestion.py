@@ -101,3 +101,35 @@ def test_manifest_surfaces_scanned_pdf_as_coverage_warning(atlas_pdf_corpus):
     assert any("settlement-letter.pdf" in x for x in m.coverage.scanned_pdfs)
     # The born-digital PDF produced real chunks (it was embedded-eligible).
     assert m.total_chunks > 0
+
+
+def _partial_pdf(path, born_scratch) -> None:
+    """A PDF with 1 real text page + 3 image-only pages (partial → text kept, pages flagged). The
+    intermediate born-digital PDF is written OUTSIDE the corpus (born_scratch) so discovery doesn't
+    pick it up as a second doc."""
+    from pypdf import PdfReader, PdfWriter
+
+    _born_digital_pdf(born_scratch, "Real declarations text on page one that must be kept")
+    w = PdfWriter()
+    w.append(PdfReader(str(born_scratch)))
+    for _ in range(3):
+        w.add_blank_page(width=612, height=792)
+    with open(path, "wb") as fh:
+        w.write(fh)
+
+
+def test_atlas_partial_pdf_keeps_text_and_flags_ocr_pages(tmp_path):
+    """A partial PDF (some image pages) keeps its extracted text AND flags the image pages for OCR —
+    it is NOT marked scanned and its text is embedded normally (MAJOR-2)."""
+    root = tmp_path / "atlas"
+    (root / "atlas-partial").mkdir(parents=True)
+    _partial_pdf(root / "atlas-partial" / "declarations.pdf", tmp_path / "_born.pdf")
+    docs = list(AtlasAdapter(root).discover())
+    pdf = next(d for d in docs if d.ext == "pdf" and d.project_id == "atlas-partial")
+    assert "must be kept" in pdf.raw_text                 # real text NOT dropped
+    assert not pdf.folder_meta.get("pdf_scanned")         # not scanned
+    assert pdf.folder_meta.get("pdf_ocr_pages") == [2, 3, 4]
+
+    m = build_manifest(docs, CorpusRules.load())
+    assert any("declarations.pdf" in x for x in m.coverage.partial_ocr_pdfs)
+    assert not m.coverage.scanned_pdfs                    # a partial doc is NOT a scanned coverage gap

@@ -20,12 +20,18 @@ _FACET_KWARGS = frozenset({
 
 def make_record(**kwargs) -> ProjectRecord:
     """Build a ProjectRecord, routing any adapter-FACET kwarg into `facts` (generic columns pass
-    through unchanged)."""
+    through unchanged).
+
+    Facts placed here default to `descriptor` PROVENANCE (authoritative, corpus-authored) — the same
+    default as StructuredFact — so a URL fact (e.g. landing_url) is TRUSTED, matching real descriptor
+    ingestion. A test that needs an UNTRUSTED (tabular) fact sets facts_provenance explicitly."""
     facts = dict(kwargs.pop("facts", {}) or {})
+    provenance = dict(kwargs.pop("facts_provenance", {}) or {})
     for name in list(kwargs):
         if name in _FACET_KWARGS:
             facts[name] = kwargs.pop(name)
     rec = ProjectRecord(**kwargs)
     for name, value in facts.items():
         rec.facts[name] = value
+        rec.facts_provenance[name] = provenance.get(name, "descriptor")
     return rec

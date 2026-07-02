@@ -19,8 +19,8 @@ import pytest
 
 from rageval import aggregate
 from rageval.enrich import entities_to_records
-from rageval.extract.tabular import CsvReader, read_tabular
-from rageval.facts import FacetSpec, StructuredFact
+from rageval.extract.tabular import CsvReader, TabularLimits, read_tabular
+from rageval.facts import PROVENANCE_TABULAR, FacetSpec, StructuredFact
 from rageval.sidecar import all_projects, connect, upsert_project
 from rageval.sources import registry
 from rageval.sources.base import HarvestedEntity, SourceAdapter
@@ -148,7 +148,8 @@ class _SpreadsheetAdapter(SourceAdapter):
                 value = row.get(column)
                 if value is None:
                     continue
-                facts.append(StructuredFact(row.get("Claim"), facet, value, provenance="descriptor"))
+                facts.append(StructuredFact(row.get("Claim"), facet, value,
+                                            provenance=PROVENANCE_TABULAR))
             yield HarvestedEntity(
                 entity_id=str(row.get("Claim")),
                 source_set=self.source_set,
@@ -239,3 +240,124 @@ def test_undeclared_column_is_not_stored(sheet_corpus, tmp_path):
     conn.close()
     assert got["sheetcorp/X-1"].fact("peril") == "hail"
     assert "secret_note" not in got["sheetcorp/X-1"].facts
+
+
+# ===========================================================================
+# CRITICAL-3 — single-column sheets are NOT silently dropped.
+# ===========================================================================
+
+def test_single_column_sheet_yields_rows_not_dropped(tmp_path):
+    """CRITICAL-3: a genuinely 1-column sheet (claim ids) MUST yield its rows — the old ≥2-cell
+    header rule dropped it silently (0 rows, no warning). Per the shape rule, with no WIDER row to
+    mark a banner, the first non-blank row is the header and its single column is KEPT — the DATA is
+    never lost (the essential property)."""
+    csvf = tmp_path / "ids.csv"
+    csvf.write_text("Claim\nC-1\nC-2\nC-3\n", encoding="utf-8")
+    data = read_tabular(csvf)
+    assert data.headers == ("Claim",)
+    assert [r.get("Claim") for r in data.rows] == ["C-1", "C-2", "C-3"]
+
+
+def test_single_column_xlsx_yields_rows_not_dropped(tmp_path):
+    """xlsx path: a 1-column sheet's data rows are all present (not silently dropped)."""
+    from openpyxl import Workbook
+
+    xlsx = tmp_path / "ids.xlsx"
+    wb = Workbook(); ws = wb.active; ws.title = "IDs"
+    for v in ["Policy", "HH-1", "HH-2"]:
+        ws.append([v])
+    wb.save(str(xlsx))
+    data = read_tabular(xlsx)
+    assert data.headers == ("Policy",)
+    assert [r.get("Policy") for r in data.rows] == ["HH-1", "HH-2"]
+
+
+def test_single_column_with_banner_keeps_all_data(tmp_path):
+    """A 1-column sheet WITH a leading banner: shape can't distinguish banner from header (no wider
+    row), so per the spec the banner becomes the header — but NO data row is lost (the guarantee)."""
+    csvf = tmp_path / "banner.csv"
+    csvf.write_text("SYNTHETIC note\nC-1\nC-2\n", encoding="utf-8")
+    data = read_tabular(csvf)
+    # Every DATA value is retained (the anti-silent-drop property); header is the first cell.
+    all_values = [next(iter(r.cells.values())) for r in data.rows]
+    assert "C-1" in all_values and "C-2" in all_values
+
+
+# ===========================================================================
+# CRITICAL-4 — duplicate / blank entity_id never silently overwrites.
+# ===========================================================================
+
+def test_duplicate_entity_id_rows_do_not_collide(sheet_corpus, tmp_path):
+    """Two rows with the SAME entity_id become TWO distinct sidecar records (disambiguated by row
+    provenance) — a count/group_by can't silently under-report. (sheet_corpus registers the adapter
+    so `peril` is a declared facet.)"""
+    ents = [
+        HarvestedEntity("C-1", "sheetcorp",
+                        facts=(StructuredFact("C-1", "peril", "flood", PROVENANCE_TABULAR),),
+                        provenance="loss-run.xlsx:S#1"),
+        HarvestedEntity("C-1", "sheetcorp",   # SAME id, different row
+                        facts=(StructuredFact("C-1", "peril", "fire", PROVENANCE_TABULAR),),
+                        provenance="loss-run.xlsx:S#2"),
+    ]
+    records = entities_to_records(ents)
+    assert len(records) == 2                       # both survive
+    keys = {r.key for r in records}
+    assert len(keys) == 2                          # distinct sidecar keys
+    db = tmp_path / "dup.sqlite"
+    conn = connect(db)
+    for rec in records:
+        upsert_project(conn, rec)
+    got = list(all_projects(conn))
+    conn.close()
+    assert len(got) == 2
+    perils = sorted(r.fact("peril") for r in got)
+    assert perils == ["fire", "flood"]            # neither row clobbered the other
+
+
+def test_blank_or_none_entity_id_is_skipped(tmp_path):
+    """An empty/None entity_id is skipped with reason — never stored as project_id='None'."""
+    ents = [
+        HarvestedEntity("", "sheetcorp",
+                        facts=(StructuredFact("", "peril", "hail", PROVENANCE_TABULAR),)),
+        HarvestedEntity(None, "sheetcorp",       # type: ignore[arg-type]
+                        facts=(StructuredFact("x", "peril", "wind", PROVENANCE_TABULAR),)),
+        HarvestedEntity("C-9", "sheetcorp",
+                        facts=(StructuredFact("C-9", "peril", "flood", PROVENANCE_TABULAR),)),
+    ]
+    records = entities_to_records(ents)
+    assert [r.project_id for r in records] == ["C-9"]   # the two blank ids are dropped
+
+
+# ===========================================================================
+# MAJOR-3 — DoS caps: streaming truncation is surfaced, not an OOM.
+# ===========================================================================
+
+def test_row_cap_truncates_and_flags(tmp_path):
+    csvf = tmp_path / "big.csv"
+    lines = ["A,B"] + [f"{i},x" for i in range(50)]
+    csvf.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    data = read_tabular(csvf, limits=TabularLimits(max_rows=10))
+    assert data.row_count == 10
+    assert data.meta["truncated"] is True
+
+
+def test_byte_cap_truncates_and_flags(tmp_path):
+    csvf = tmp_path / "wide.csv"
+    csvf.write_text("A,B\n" + "1,2\n" * 1000, encoding="utf-8")
+    data = read_tabular(csvf, limits=TabularLimits(max_bytes=20))
+    assert data.meta["truncated"] is True
+
+
+# ===========================================================================
+# minor — merged-cell / short rows (None cells) don't crash and pad correctly.
+# ===========================================================================
+
+def test_merged_cell_none_values_are_handled(tmp_path):
+    """A merged/short row surfaces as None-padded cells (openpyxl yields None for merged gaps)."""
+    xlsx = tmp_path / "merged.xlsx"
+    _write_xlsx(xlsx, "M", "banner", ["A", "B", "C"],
+                [["a1", None, "c1"], ["a2", "b2", None]])
+    data = read_tabular(xlsx)
+    assert data.row_count == 2
+    assert data.rows[0].get("B") is None and data.rows[0].get("C") == "c1"
+    assert data.rows[1].get("C") is None

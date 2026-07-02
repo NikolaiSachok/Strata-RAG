@@ -28,7 +28,7 @@ import argparse
 
 import dataclasses
 
-from .chunking import Chunk, chunk_text
+from .chunking import Chunk, chunk_text_with_pages
 from .classify import CorpusRules, partition
 from .config import SETTINGS, Settings, is_sample_corpus
 from .embeddings import get_embedder
@@ -103,11 +103,15 @@ def _warn_on_corpus_mismatch(existing: set[str], *, ingesting_sample: bool) -> N
 
 
 def build_chunks(included_docs: list[SourceDoc], settings: Settings = SETTINGS) -> list[Chunk]:
-    """Chunk every INCLUDED doc into retrievable units, carrying provenance metadata."""
+    """Chunk every INCLUDED doc into retrievable units, carrying provenance metadata.
+
+    PDF page provenance (MAJOR-1): chunk with `chunk_text_with_pages` so EVERY chunk resolves to the
+    page its content STARTS on (not just a page's first chunk) — the page rides into the payload and
+    out to the citation. Non-PDF docs have no `[page N]` markers, so `page` is None."""
     chunks: list[Chunk] = []
     for d in included_docs:
-        for i, piece in enumerate(chunk_text(d.raw_text, size=settings.chunk_size,
-                                             overlap=settings.chunk_overlap)):
+        for i, (piece, page) in enumerate(chunk_text_with_pages(
+                d.raw_text, size=settings.chunk_size, overlap=settings.chunk_overlap)):
             chunks.append(
                 Chunk(
                     text=piece,
@@ -116,6 +120,7 @@ def build_chunks(included_docs: list[SourceDoc], settings: Settings = SETTINGS) 
                     source=d.doc_path.name,
                     doc_type=d.doc_type,
                     chunk_index=i,
+                    page=page,
                 )
             )
     return chunks
