@@ -29,12 +29,15 @@ import html as _html
 import re
 from typing import Iterable
 
-from .base import (
-    SourceAdapter,
-    SourceDoc,
+from pathlib import Path
+
+from .base import ClassificationPolicy, SourceAdapter, SourceDoc
+from .sample_facts import harvest_facts_for, sample_declared_facets
+from .sample_policy import (
     docs_txt_doc_type,
     is_metadata_only_file,
     is_store_listing_txt,
+    sample_classification_policy,
 )
 
 _TEXT_EXTS = {".md", ".txt"}
@@ -181,6 +184,19 @@ class AtlasAdapter(SourceAdapter):
                         yield self._mk(project_id, path, "promo", path.suffix.lstrip("."),
                                        visible, project_dir)
                         break  # one landing page is enough
+
+    def declared_facets(self):
+        """(#36) This corpus's declared structured facets (sources/sample_facts)."""
+        return sample_declared_facets()
+
+    def harvest_facts(self, project_id: str, project_dir: Path):
+        """(#36) Structured facts from this project's back/config.yaml descriptor. The concrete
+        field whitelist + secret handling live in sources/sample_facts (owned by this adapter)."""
+        return harvest_facts_for(project_id, project_dir)
+
+    def classification_policy(self) -> ClassificationPolicy:
+        """(#37) This corpus's declared allow_ext + file rules (sources/sample_policy)."""
+        return sample_classification_policy()
 
     def _mk(self, project_id, path, doc_type, ext, text, project_dir) -> SourceDoc:
         return SourceDoc(

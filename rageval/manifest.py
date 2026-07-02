@@ -21,7 +21,7 @@ import statistics
 from dataclasses import dataclass, field
 
 from .chunking import chunk_text
-from .classify import CorpusRules, classify
+from .classify import CorpusRules, PolicyResolver, classify
 from .config import SETTINGS, Settings
 from .redact import redact
 from .sources.base import SourceDoc
@@ -88,8 +88,11 @@ def build_manifest(all_docs: list[SourceDoc], rules: CorpusRules,
     # project -> number of INCLUDED docs (for coverage + outlier detection)
     included_per_project: dict[str, int] = {}
 
+    # Resolve each doc's adapter ClassificationPolicy (#37), cached by source_set.
+    resolver = PolicyResolver()
+
     for doc in all_docs:
-        dec = classify(doc, rules)
+        dec = classify(doc, rules, resolver.policy_for(doc.source_set))
         if dec.include:
             # Plan the SAME redaction the ingest will do (secrets AND PII), so the manifest's
             # chunk/char estimate matches reality and BOTH guardrail counts are visible before

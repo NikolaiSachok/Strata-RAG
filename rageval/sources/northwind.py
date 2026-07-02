@@ -17,7 +17,13 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Iterable
 
-from .base import SourceAdapter, SourceDoc, docs_txt_doc_type, is_metadata_only_file
+from .base import ClassificationPolicy, SourceAdapter, SourceDoc
+from .sample_facts import harvest_facts_for, sample_declared_facets
+from .sample_policy import (
+    docs_txt_doc_type,
+    is_metadata_only_file,
+    sample_classification_policy,
+)
 
 # Map filename/location patterns to a coarse doc_type. The classifier reasons partly off
 # doc_type, so naming it here (cheaply, from the path) is useful even for noise.
@@ -88,3 +94,16 @@ class NorthwindAdapter(SourceAdapter):
                     raw_text=text,
                     folder_meta={"project_dir": project_dir.name},
                 )
+
+    def declared_facets(self):
+        """(#36) This corpus's declared structured facets (sources/sample_facts)."""
+        return sample_declared_facets()
+
+    def harvest_facts(self, project_id: str, project_dir: Path):
+        """(#36) Structured facts from this project's back/config.yaml descriptor. The concrete
+        field whitelist + secret handling live in sources/sample_facts (owned by this adapter)."""
+        return harvest_facts_for(project_id, project_dir)
+
+    def classification_policy(self) -> ClassificationPolicy:
+        """(#37) This corpus's declared allow_ext + file rules (sources/sample_policy)."""
+        return sample_classification_policy()

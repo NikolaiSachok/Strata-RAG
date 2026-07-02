@@ -25,3 +25,31 @@ def _ensure_sample_placeholders():
     """Recreate any gitignored sample-corpus placeholder files before the suite runs."""
     materialize()
     yield
+
+
+@pytest.fixture(autouse=True)
+def _reset_registries():
+    """(#38 follow-up) Reset the PROCESS-GLOBAL registries between every test so one test's
+    registered corpus adapters / query classes / roster families never leak into the next.
+
+    The registries (`sources.registry.ADAPTER_BY_FOLDER`, `query_classes._REGISTRY`,
+    `roster._FAMILY_TO_TSV_STEM`) are module-level mutable globals — the engine currently supports
+    ONE corpus per process (see the docstrings at each definition and the tracked follow-up:
+    per-corpus registry scoping). Snapshot + restore here so test isolation doesn't depend on every
+    test remembering to do it by hand."""
+    from rageval import query_classes as qcmod
+    from rageval import roster as roster_mod
+    from rageval.sources import registry
+
+    saved_adapters = dict(registry.ADAPTER_BY_FOLDER)
+    saved_qc = qcmod.registered_classes()
+    saved_families = dict(roster_mod._FAMILY_TO_TSV_STEM)
+    try:
+        yield
+    finally:
+        registry.ADAPTER_BY_FOLDER.clear()
+        registry.ADAPTER_BY_FOLDER.update(saved_adapters)
+        qcmod._REGISTRY.clear()
+        qcmod._REGISTRY.update(saved_qc)
+        roster_mod._FAMILY_TO_TSV_STEM.clear()
+        roster_mod._FAMILY_TO_TSV_STEM.update(saved_families)

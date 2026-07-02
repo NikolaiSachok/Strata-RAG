@@ -18,7 +18,8 @@ from rageval import api
 from rageval.agent import ChatAgent
 from rageval.eval import EvalResult, Judge
 from rageval.generate import Answer
-from rageval.sidecar import ProjectRecord, connect, upsert_project
+from tests._helpers import make_record
+from rageval.sidecar import connect, upsert_project
 from tests.test_agent import ScriptedLLM, StubPipeline, _final, _tool
 
 
@@ -27,9 +28,9 @@ def sidecar(tmp_path, monkeypatch):
     db = tmp_path / "side.sqlite"
     conn = connect(db)
     for r in [
-        ProjectRecord(project_id="1", source_set="northwind", publisher="Maple",
+        make_record(project_id="1", source_set="northwind", publisher="Maple",
                       app_category="game", app_name="Alpha", chunk_count=3),
-        ProjectRecord(project_id="2", source_set="northwind", publisher="Cedar",
+        make_record(project_id="2", source_set="northwind", publisher="Cedar",
                       app_category="utility", app_name="Beta", chunk_count=5),
     ]:
         upsert_project(conn, r)

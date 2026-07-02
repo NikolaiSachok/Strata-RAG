@@ -118,11 +118,17 @@ def reconcile(tsv_rows: list[TsvRow],
     A project_id can appear under several sidecar source_sets (e.g. northwind vs northwind-extra);
     we match a roster row to ANY sidecar record sharing its project_id. Sidecar records with a
     project_id absent from every roster become `tsv-missing`."""
-    # Index the sidecar by project_id → list of (key, app_name).
+    # Index the sidecar by project_id → list of (key, app_name). app_name is a corpus FACET
+    # (schema-agnostic store); a record exposes it via .fact('app_name') (None for a corpus that
+    # doesn't declare it, handled as "" — roster is then the sole record).
+    def _app_name(rec) -> str:
+        getter = getattr(rec, "fact", None)
+        return (getter("app_name") if callable(getter) else getattr(rec, "app_name", None)) or ""
+
     side_by_pid: dict[str, list[tuple[str, str]]] = {}
     for rec in sidecar:
         side_by_pid.setdefault(rec.project_id, []).append(
-            (f"{rec.source_set}/{rec.project_id}", rec.app_name or ""))
+            (f"{rec.source_set}/{rec.project_id}", _app_name(rec)))
 
     findings: list[RosterFinding] = []
     matched_pids: set[str] = set()
@@ -148,9 +154,9 @@ def reconcile(tsv_rows: list[TsvRow],
     # Sidecar projects whose project_id is in NO roster → tsv-missing (sidecar inferred a title).
     tsv_pids = {r.project_id for r in tsv_rows}
     for rec in sidecar:
-        if rec.project_id not in tsv_pids and (rec.app_name or ""):
+        if rec.project_id not in tsv_pids and _app_name(rec):
             findings.append(RosterFinding(rec.project_id, "", "",
-                                          f"{rec.source_set}/{rec.project_id}", rec.app_name or "",
+                                          f"{rec.source_set}/{rec.project_id}", _app_name(rec),
                                           "tsv-missing"))
     return findings
 

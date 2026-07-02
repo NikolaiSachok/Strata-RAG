@@ -41,9 +41,10 @@ from . import guardrails as g
 if TYPE_CHECKING:
     from .roster import Roster
 from .config import SETTINGS, Settings
-from .harvest import ConfigHarvest, harvest_project
+from .facts import StructuredFact
 from .sidecar import ProjectRecord
 from .sources.base import SourceDoc
+from .sources.registry import adapter_class_for_source_set, all_declared_facets
 
 
 def _log(msg: str) -> None:
@@ -191,9 +192,11 @@ def _fallback_record(source_set: str, project_id: str, docs: list[SourceDoc],
         non_conforming=prov["non_conforming"],
     )
     # Seed structured fields from settings.md even without an LLM (degrades gracefully if absent).
-    # The structured 'app_name' (from a Brand:/Name: line or a folder hint) is the PRODUCT name.
+    # The structured 'app_name' (from a Brand:/Name: line or a folder hint) is the PRODUCT name — a
+    # declared FACET (written fail-closed via _set_fact). Category/theme are generic enrichment
+    # columns on the record.
     if structured.get("app_name"):
-        rec.app_name = structured["app_name"]
+        _set_fact(rec, "app_name", structured["app_name"], "settings")
     if structured.get("app_category"):
         rec.app_category = structured["app_category"]
     if structured.get("theme"):
@@ -201,26 +204,47 @@ def _fallback_record(source_set: str, project_id: str, docs: list[SourceDoc],
     return rec
 
 
-def _apply_harvest(rec: ProjectRecord, harvest: ConfigHarvest) -> None:
-    """Fold the deterministic config.yaml harvest into the record (mutates in place).
+def _set_fact(rec: ProjectRecord, name: str, value: object, provenance: str) -> None:
+    """Write ONE adapter fact into the record's generic facts dict — fail-closed against the
+    DECLARED facet allowlist (an undeclared field is never stored). The core enumerates NO facet
+    name; the allowlist comes from adapter declarations. Skips empty values."""
+    if value in (None, "", [], {}):
+        return
+    if name not in all_declared_facets():
+        return  # fail-closed: only a declared facet is writable
+    rec.facts[name] = value
+    rec.facts_provenance[name] = provenance
 
-    config.yaml's `app.name`/`app.domain` are the HIGHEST-confidence structured source for a
-    project, so for app_name they WIN: config.yaml app.name > settings.md structured name >
-    LLM-extracted product name. We only OVERWRITE app_name when config.yaml actually supplied
-    one (else we keep the settings.md/LLM value). The harvested domain/landing_url/number/etc.
-    always win (authoritative system-of-record fields, not free-text guesses). Absent config.yaml
-    → app_name is left as-is and the harvest fields stay None (graceful degradation, flagged in
-    the coverage report). NOTE: this NEVER touches publisher — that is a TSV-join-only field."""
-    if harvest.app_name:
-        rec.app_name = harvest.app_name          # config.yaml app.name is top priority for app_name
-    rec.domain = harvest.domain
-    rec.landing_url = harvest.landing_url
-    rec.app_number = harvest.app_number
-    rec.bundle_id = harvest.bundle_id
-    rec.localization = harvest.localization
-    if harvest.contact_emails:
-        rec.contact_emails = harvest.contact_emails
-        rec.contact_emails_derived = harvest.contact_emails_derived
+
+def _harvest_facts(source_set: str, project_dir: Path | None,
+                   project_id: str) -> list[StructuredFact]:
+    """Ask the source_set's adapter for its structured facts (#36). Corpus-agnostic: the core
+    resolves the adapter by source_set and consumes whatever it emits, knowing NO field names.
+    Degrades to [] when there's no registered adapter or no on-disk project dir."""
+    if project_dir is None:
+        return []
+    cls = adapter_class_for_source_set(source_set)
+    if cls is None:
+        return []
+    try:
+        # The hook is a pure read over the descriptor; construct the adapter on the corpus family
+        # root (the project's parent) — only `harvest_facts` is called, which takes an explicit dir.
+        adapter = cls(project_dir.parent)
+        return list(adapter.harvest_facts(project_id, project_dir))
+    except Exception:  # noqa: BLE001 — a broken descriptor never crashes enrichment
+        return []
+
+
+def _apply_facts(rec: ProjectRecord, facts: list[StructuredFact]) -> None:
+    """Fold adapter-supplied StructuredFacts into the record's generic facts store (mutates in
+    place). The core knows NO field names: each fact names a DECLARED facet (fail-closed via
+    _set_fact) and carries its provenance. Descriptor/derived facts are AUTHORITATIVE structured
+    metadata, so they WIN over any settings.md/LLM value written earlier for the same facet
+    (mirroring the old 'config.yaml wins' precedence, now corpus-agnostic and schema-free). An
+    empty fact list leaves the record untouched. Type coercion + a final fail-closed check happen
+    again at sidecar write."""
+    for fact in facts:
+        _set_fact(rec, fact.field, fact.value, fact.provenance)
 
 
 def _parse_json(raw: str) -> dict:
@@ -262,11 +286,13 @@ def _enrich_project_inner(llm, source_set: str, project_id: str, docs: list[Sour
     llm_failed = False
     rec = _fallback_record(source_set, project_id, docs, chunk_count)
     structured = _best_metadata_source(docs)
-    # DETERMINISTIC config.yaml harvest (no LLM): runs in BOTH paths so domain/landing_url/app_name
-    # reach the sidecar whether or not an enrichment backend is configured.
+    # DETERMINISTIC structured-fact harvest (#36, no LLM): the source_set's ADAPTER supplies facts
+    # from its per-project descriptor — corpus-agnostic, the core knows no field names. Runs in
+    # BOTH paths so descriptor facts reach the sidecar whether or not an enrichment backend exists.
     proj_dir = _project_dir(docs, project_id)
-    harvest = harvest_project(proj_dir) if proj_dir is not None else ConfigHarvest()
-    _apply_harvest(rec, harvest)
+    facts = _harvest_facts(source_set, proj_dir, project_id)
+    harvest_present = bool(facts)  # the adapter emitted structured facts for this project
+    _apply_facts(rec, facts)
     # PUBLISHER (deterministic, NOT the LLM): the publisher may be absent from the docs, so it
     # comes ONLY from the authoritative roster TSV join. Runs in BOTH paths (LLM or
     # structural-only). None when no roster row / no roster file.
@@ -299,8 +325,11 @@ def _enrich_project_inner(llm, source_set: str, project_id: str, docs: list[Sour
     tags = data.get("theme_tags") or []
     if not isinstance(tags, list):
         tags = [str(tags)]
-    # The LLM extracts the PRODUCT name (app_name), never the publisher.
-    rec.app_name = (data.get("app_name") or None) if data.get("app_name") != "null" else None
+    # The LLM extracts the PRODUCT name (app_name) — a declared FACET (written fail-closed), never
+    # the publisher. Category/theme/humor/summary are generic enrichment columns on the record.
+    llm_app_name = (data.get("app_name") or None) if data.get("app_name") != "null" else None
+    if llm_app_name:
+        _set_fact(rec, "app_name", llm_app_name, "enriched")
     rec.app_category = data.get("app_category") or None
     rec.theme_tags = [str(t).lower() for t in tags][:5]
     hv = data.get("has_humor")
@@ -308,27 +337,27 @@ def _enrich_project_inner(llm, source_set: str, project_id: str, docs: list[Sour
     rec.one_line_summary = data.get("one_line_summary") or None
 
     # PREFER the structured settings.md fields over the LLM's free-text guess (the decision:
-    # structured metadata wins when present). settings.md's Brand/Name (→ app_name) / Category
-    # are authoritative over the LLM's extraction (config.yaml then wins over settings.md below).
+    # structured metadata wins when present). settings.md's Brand/Name (→ app_name FACET) / Category
+    # are authoritative over the LLM's extraction (a descriptor then wins over settings.md below).
     if structured.get("app_name"):
-        rec.app_name = structured["app_name"]
+        _set_fact(rec, "app_name", structured["app_name"], "settings")
     if structured.get("app_category"):
         rec.app_category = structured["app_category"]
     if structured.get("theme") and structured["theme"].lower() not in rec.theme_tags:
         rec.theme_tags = ([structured["theme"].lower()] + rec.theme_tags)[:5]
 
-    # Re-apply the config.yaml harvest AFTER the LLM pass: app.name/app.domain are the highest-
-    # confidence structured source and the LLM must not clobber them (config.yaml app.name is the
+    # Re-apply the structured facts AFTER the LLM pass: descriptor fields are the highest-
+    # confidence structured source and the LLM must not clobber them (a descriptor app_name is the
     # top-priority source for app_name). The harvested domain/landing_url/etc. are authoritative.
-    _apply_harvest(rec, harvest)
+    _apply_facts(rec, facts)
 
-    # CONFIDENCE (observability): 'high' if a structured metadata source (settings.md OR
-    # config.yaml) OR a clear app_name+category was obtained; 'low' if the project yielded
-    # thin/absent metadata — those are flagged in the coverage report so a reviewer sees weak spots.
+    # CONFIDENCE (observability): 'high' if a structured metadata source (settings.md OR the
+    # adapter's descriptor facts) OR a clear app_name+category was obtained; 'low' if the project
+    # yielded thin/absent metadata — flagged in the coverage report so a reviewer sees weak spots.
     has_metadata_doc = any(d.doc_type == "metadata" for d in docs)
-    if (has_metadata_doc and structured) or harvest.present:
+    if (has_metadata_doc and structured) or harvest_present:
         rec.metadata_confidence = "high"
-    elif rec.app_name or rec.app_category:
+    elif rec.fact("app_name") or rec.app_category:
         rec.metadata_confidence = "high"
     else:
         rec.metadata_confidence = "low"
@@ -395,7 +424,7 @@ def enrich_all(included_docs: list[SourceDoc], chunk_counts: dict[tuple[str, str
             # Show BOTH name facets so the app_name (product) vs publisher (TSV-authoritative)
             # distinction is visible. publisher shows '—' when unmapped.
             _log(f"[enrich {done}/{total}] {rec.key} ✓ "
-                 f"app={rec.app_name!r} publisher={rec.publisher or '—'!r} "
+                 f"app={rec.fact('app_name')!r} publisher={rec.publisher or '—'!r} "
                  f"confidence={rec.metadata_confidence}")
         records.append(rec)
         if on_record is not None:

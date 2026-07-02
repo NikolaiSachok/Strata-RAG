@@ -4,89 +4,73 @@ These two types are the contract between "where documents come from" (corpus-spe
 behind an adapter) and "what we do with them" (corpus-agnostic: classify, chunk, embed,
 index). Keep this module tiny and dependency-light — it's the shape everything else
 agrees on.
+
+PHASE-4 (corpus-agnostic engine): the adapter contract carries THREE optional hooks so ALL
+corpus-specific knowledge lives behind the adapter, and a corpus that overrides none still
+works on the generic defaults:
+
+  * discover()             — walk the corpus → SourceDoc candidates (the only required method).
+  * harvest_facts()        — (#36) yield StructuredFacts for the metadata sidecar. Default: none.
+  * classification_policy()— (#37) declare per-corpus ingestion classification: the allowed
+                             content extensions + filename/asset RULES (drop / metadata-only /
+                             retype). Default: a generic policy that declares nothing extra.
+
+The concrete filename heuristics for the bundled sample corpus (store-listing duplicates,
+metadata-only files, docs/*.txt content-vs-config) used to live HERE as shared helpers; they are
+now the sample adapters' declared POLICY (see sources/sample_policy.py). The core keeps only the
+generic mechanism + defaults.
 """
 
 from __future__ import annotations
 
 import abc
-import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable
 
-# --- provenance-aware dedup: store-listing detection (shared by every adapter) ----------
-# App-store / Google-Play listing txt files are DERIVED from a project's canonical
-# description (reformatted to each store's length/policy limits). They are near-duplicates
-# that triplicate a project in top-k retrieval and hurt result diversity. Adapters treat
-# them as a promo FALLBACK — yielded ONLY when the project has no canonical description —
-# exactly like the index.* landing-page fallback. One regex here = one source of truth.
-#
-# Recognised store-listing names (case-insensitive, .txt only):
-#   description_app_store.txt · description_google_play.txt   (the canonical pair)
-#   <anything>_app_store.txt  · <anything>_google_play.txt     (per-locale / variant)
-#   store_listing.txt · app_store.txt · google_play.txt        (bare variants)
-_STORE_LISTING_TXT = re.compile(
-    r"(^|.*[_-])(app[_-]?store|google[_-]?play|play[_-]?store|store[_-]?listing)\.txt$",
-    re.IGNORECASE,
-)
-# A file whose name marks it the CANONICAL description (preferred over any store listing).
-_CANONICAL_DESCRIPTION = re.compile(r"^description\.(md|txt)$", re.IGNORECASE)
+from ..facts import FacetSpec, StructuredFact
 
 
-def is_store_listing_txt(name: str) -> bool:
-    """True if `name` is a derived app-store / Google-Play listing .txt file."""
-    return bool(_STORE_LISTING_TXT.match(name))
+@dataclass(frozen=True)
+class FileRule:
+    """One adapter-declared classification rule matched against a discovered doc's FILENAME.
+
+    The core provides the MECHANISM (a rule can drop a file, mark it metadata-only, or retype it);
+    the adapter supplies the POLICY (which filenames, and what to do). A rule matches by exact
+    filename (`name`, case-insensitive) OR by glob (`glob`, fnmatch). Exactly one action applies:
+
+      action="drop"          — exclude the doc (reason carries the adapter's explanation).
+      action="metadata_only" — INCLUDE but route to enrich, NOT the vector index (e.g. a
+                               structured settings file). doc_type is optionally retyped too.
+      action="retype"        — keep the doc but change its doc_type to `doc_type` (e.g. tag a
+                               credential dump 'config' so a corpus rule drops it downstream).
+
+    Kept corpus-neutral: the core never enumerates a filename; it just applies whatever rules an
+    adapter declares. A corpus that declares none gets the generic default (nothing extra)."""
+    action: str                      # "drop" | "metadata_only" | "retype"
+    name: str | None = None          # exact filename match (case-insensitive)
+    glob: str | None = None          # fnmatch glob (case-insensitive), e.g. "*_store.txt"
+    doc_type: str | None = None      # for retype / metadata_only: the doc_type to assign
+    reason: str = ""                 # human-readable reason surfaced in the manifest
 
 
-# --- docs/*.txt content-vs-config disambiguation (shared by every adapter) --------------
-# CORRECTION to an earlier over-broad rule: the adapters used to tag EVERY .txt directly under
-# docs/ as doc_type 'config' (which corpus-rules drops). That produced FALSE NEGATIVES — real
-# product content named *.txt was silently dropped. The truth (from a layout survey): a few
-# docs/*.txt filenames are genuine config/credential dumps, but several are CONTENT:
-#   description.txt → store/app copy (a 'description'); ideas.txt / design.txt → gameplay /
-#   visual-theme concept (a 'spec'). So we map by FILENAME instead of blanket-tagging the dir.
-# Genuine config that must STAY excluded (credentials / Figma-link / build setup dumps).
-_CONFIG_TXT_NAMES = frozenset({"accounts.txt", "settings.txt", "setup.txt"})
-# Content-named docs/*.txt → the doc_type they really are (so classify.py KEEPS them).
-_CONTENT_TXT_TYPES: dict[str, str] = {
-    "description.txt": "description",  # store/app copy
-    "ideas.txt": "spec",              # gameplay concept
-    "design.txt": "spec",             # visual/theme requirements
-}
+@dataclass(frozen=True)
+class ClassificationPolicy:
+    """A corpus's ingestion-classification policy, declared by its adapter (#37).
 
+    The engine ships a GENERIC default (no extra extensions, no file rules) so a corpus that
+    declares nothing still classifies via corpus-rules.yaml alone. An adapter overrides
+    `classification_policy()` to add:
 
-# --- settings.md → metadata-only (enriched, NOT embedded) -------------------------------
-# settings.md is rich per-project METADATA (Brand/Theme/Mascot/Category) for some projects,
-# thin/absent for others. It is metadata, not narrative: embedding many such docs dilutes
-# top-k with key:value boilerplate. Decision: tag it doc_type 'metadata' so the indexer SKIPS
-# it (excluded from the vector index) while the enrich step still CONSUMES it as the preferred
-# structured source. A 'metadata' doc is INCLUDED-but-metadata_only (see classify.py).
-_METADATA_FILENAMES = frozenset({"settings.md"})
+      allow_ext  — content extensions this corpus contributes ON TOP OF the corpus-rules.yaml
+                   baseline. Per-corpus, so adding a format for one corpus can never silently
+                   change another (the classifier unions the adapter's set with the baseline for
+                   THAT corpus's docs only).
+      file_rules — adapter-declared FileRules (drop / metadata-only / retype by filename).
 
-
-def is_metadata_only_file(name: str) -> bool:
-    """True if `name` is a metadata file routed to enrich only (e.g. settings.md): not
-    embedded as retrieval chunks, but fed to the metadata-enrichment step."""
-    return name.lower() in _METADATA_FILENAMES
-
-
-def docs_txt_doc_type(name: str) -> str:
-    """doc_type for a .txt file living directly under a `docs/` dir.
-
-    Returns 'config' for genuine credential/setup dumps (excluded downstream), or the real
-    content type ('description'/'spec') for content-named files. Anything else defaults to
-    'config' (conservative: an unknown docs/*.txt is more likely a dump than product copy)."""
-    low = name.lower()
-    if low in _CONTENT_TXT_TYPES:
-        return _CONTENT_TXT_TYPES[low]
-    if low in _CONFIG_TXT_NAMES:
-        return "config"
-    return "config"
-
-
-def is_canonical_description(name: str) -> bool:
-    """True if `name` is the canonical product description (description.md / description.txt)."""
-    return bool(_CANONICAL_DESCRIPTION.match(name))
+    Everything here is corpus-neutral in TYPE; the concrete values are the adapter's business."""
+    allow_ext: frozenset[str] = frozenset()
+    file_rules: tuple[FileRule, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -155,6 +139,32 @@ class SourceAdapter(abc.ABC):
         adapter found them; a rule dropped them).
         """
         raise NotImplementedError
+
+    # ---- optional Phase-4 hooks (generic defaults so a corpus can override none) --------
+
+    def declared_facets(self) -> Iterable[FacetSpec]:
+        """(#36/#40) Declare this corpus's structured FACETS — the positive, fail-closed allowlist
+        of fields the adapter may emit as StructuredFacts, each with a value TYPE. This is the
+        source of truth for BOTH storage (only a declared facet is stored) and queryability
+        (aggregate validates a query field against the declared facets — NOT a core dataclass). The
+        engine core enumerates NO facet name; a corpus declares its own. Default: no facets."""
+        return ()
+
+    def harvest_facts(self, project_id: str, project_dir: Path) -> Iterable[StructuredFact]:
+        """(#36) Yield StructuredFacts for one project's metadata sidecar, from a per-project
+        DESCRIPTOR (a config file / manifest / spreadsheet) that is NOT a narrative document and
+        should never be embedded. The core consumes whatever facts an adapter emits and knows NO
+        field names; the whitelist / fail-closed secret handling lives in the adapter's harvester
+        (built on the reusable rageval.facts primitive). Only facts naming a DECLARED facet are
+        stored (fail-closed). Default: no structured facts."""
+        return ()
+
+    def classification_policy(self) -> ClassificationPolicy:
+        """(#37) Declare this corpus's ingestion-classification policy: the extra content
+        extensions it contributes + its filename/asset FileRules (drop / metadata-only / retype).
+        Default: a generic policy that declares nothing (the corpus classifies via
+        corpus-rules.yaml alone)."""
+        return ClassificationPolicy()
 
     # ---- small shared helpers concrete adapters can reuse ------------------
 

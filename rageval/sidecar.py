@@ -1,22 +1,40 @@
-"""Metadata sidecar — a SQLite table of structured per-project records.
+"""Metadata sidecar — a SQLite structured store of per-project records.
 
 WHY a sidecar at all (the core design insight): target questions split into two classes,
 and a vector top-k FAILS the second:
 
   * "which projects have a fruit-like theme?"        → SEMANTIC retrieval (embed → top-k)
-  * "list every brand and count projects per brand"  → AGGREGATION (GROUP BY + COUNT)
+  * "list every publisher and count projects per one" → AGGREGATION (GROUP BY + COUNT)
   * "themes used in BOTH source-sets"                → SET INTERSECTION over a facet
 
 A vector index cannot count or intersect — it returns the k nearest chunks, full stop.
-So ingest produces BOTH a semantic index (Qdrant) AND this structured table, which
+So ingest produces BOTH a semantic index (Qdrant) AND this structured store, which
 answers exact aggregation/filter/intersection queries with plain SQL.
 
-It's also an OBSERVABILITY surface: `SELECT * FROM projects WHERE app_name IS NULL` finds
-enrichment gaps; `GROUP BY publisher` aggregates the publisher facet; chunk-count
-outliers flag bad include rules. SQLite is stdlib (no dependency) and its SQL is the clearest
-way to teach the aggregation angle.
+SCHEMA-AGNOSTIC STRUCTURED STORE (#36 — the corpus-agnostic core):
+  The store has TWO parts:
 
-The sidecar file is gitignored — when built from a custom corpus it holds brand/theme data.
+    1. `projects`      — GENERIC per-project columns the ENGINE owns: structural ids + the LLM
+                         enrichment outputs (category/theme_tags/humor/summary) + provenance
+                         (status/lineage) + the roster `publisher`. NO corpus-specific
+                         structured-fact column lives here.
+    2. `project_facts` — a GENERIC facet/EAV table: one row per (project, field) for every
+                         adapter-emitted StructuredFact, with the value + its declared TYPE +
+                         provenance. This is the SOURCE OF TRUTH for adapter facts. A corpus's
+                         app-shaped fields (app_name/domain/bundle_id/…) are the SAMPLE ADAPTER's
+                         DECLARED facets stored here — NOT hardcoded core columns. A brand-new
+                         corpus emitting `premium`/`cause_of_loss`/… stores + queries them with NO
+                         core edit.
+
+  Aggregation (aggregate.py) queries a dynamic VIEW that pivots the declared facets onto columns
+  and LEFT-JOINs `projects`, so count/list/group_by/lookup work over ANY declared facet exactly as
+  they did over the old hardcoded columns — the queryable field set is the UNION of adapter-declared
+  facets + the generic `projects` columns, validated against the DECLARATIONS, never a dataclass.
+
+`ProjectRecord` remains a typed CONVENIENCE VIEW (generic columns as attributes + a `facts` dict for
+the adapter facets); the generic facet store is the path that makes a non-app field queryable.
+
+The sidecar file is gitignored — when built from a custom corpus it holds that corpus's data.
 """
 
 from __future__ import annotations
@@ -27,19 +45,32 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from .config import SIDECAR_PATH
+from .facts import coerce_facet_value
 
 
 @dataclass
 class ProjectRecord:
-    """One structured row per project (produced by enrich.py).
+    """One structured per-project record (produced by enrich.py). A typed convenience view over the
+    GENERIC `projects` columns PLUS a `facts` dict carrying whatever structured facts the adapter
+    emitted (the schema-agnostic part). The engine core enumerates NO corpus facet name.
 
-    The last three fields are optional PROVENANCE/LINEAGE, derived from folder structure (not the
-    LLM) by whichever adapter chooses to populate them:
-      kotlin_source_id — for a project ported from a predecessor, the source project id (parsed
-                         from a docx named "<new_id> (<source_id>)"). Enables the lineage query
-                         "what was 2023 ported from?".
-      status           — for non-conforming projects: released | unreleased | banned.
-      non_conforming   — True for projects that don't follow the standard structure.
+    Generic columns:
+      project_id / source_set — identity (key = "source_set/project_id").
+      app_category / theme_tags / has_humor / one_line_summary — the LLM ENRICHMENT outputs
+                         (generic: any corpus gets a category/theme/summary; produced by the core
+                         enricher, not a corpus descriptor).
+      doc_types / chunk_count — structural bookkeeping.
+      kotlin_source_id / status / non_conforming — optional PROVENANCE/LINEAGE from folder
+                         structure (an adapter may populate them via folder_meta).
+      publisher          — authoritative label from the roster TSV join (roster.py); never LLM.
+      metadata_confidence— enrichment confidence (high|low|None).
+
+    Adapter structured facts (the schema-agnostic store):
+      facts              — {field: value} for every adapter-declared facet this project has (e.g.
+                           {"app_name": "...", "domain": "..."} for the sample corpus, or
+                           {"premium": 1200, "cause_of_loss": "..."} for another). Stored in
+                           `project_facts`; queryable via the pivoted aggregation view.
+      facts_provenance   — {field: provenance} companion (e.g. "descriptor" | "derived").
     """
     project_id: str
     source_set: str
@@ -52,104 +83,100 @@ class ProjectRecord:
     kotlin_source_id: str | None = None
     status: str | None = None
     non_conforming: bool | None = None
-    # TWO DISTINCT "name" facets (deliberately split — they are NOT the same thing):
-    #   app_name   — the project's PRODUCT / display name (a fictional e.g. "Frostline Fishing
-    #                Log"). Source priority: config.yaml app.name > settings.md structured name >
-    #                LLM-extracted product name. Stated in the docs, so the LLM/harvest extracts
-    #                it confidently. (This CONSOLIDATES the old conflated product-name field.)
-    #   publisher  — an AUTHORITATIVE label each project is associated with (a fictional e.g.
-    #                "Maple Lagoon"), supplied via a roster TSV. It may DIFFER from the product
-    #                title and be ABSENT from the docs, so it is NOT inferred by the LLM — it comes
-    #                from a deterministic roster TSV join (roster.py), the authoritative ground
-    #                truth. None when no roster row / no roster file.
     publisher: str | None = None
-    # STRUCTURED METADATA harvested DETERMINISTICALLY from back/config.yaml (harvest.py) — a
-    # field-WHITELIST (never secrets). These power metadata queries the vector index can't serve
-    # (e.g. "website URLs for fruit-themed apps?": theme from enrich + URL from here).
-    #   app_name       — see above (config.yaml app.name is its highest-confidence source).
-    #   domain         — app.domain (the homepage/website host); landing_url is derived from it.
-    #   landing_url    — DERIVED: "https://" + domain.
-    #   app_number     — app.number (store/build number).
-    #   bundle_id      — app.bundle_id.
-    #   localization   — app.localization (e.g. "EN").
-    #   contact_emails — best-effort, DERIVED from the public PHP templates (<local>@<domain>);
-    #                    null when the template is too indirected to resolve honestly.
-    #   contact_emails_derived — True iff contact_emails was constructed (provenance flag; the
-    #                    address is not a verbatim literal, it's <localpart> joined to <domain>).
-    app_name: str | None = None
-    domain: str | None = None
-    landing_url: str | None = None
-    app_number: str | None = None
-    bundle_id: str | None = None
-    localization: str | None = None
-    contact_emails: list[str] = field(default_factory=list)
-    contact_emails_derived: bool | None = None
-    # OBSERVABILITY: how confident we are in this project's enriched metadata.
-    #   "high"  — a structured metadata source (settings.md) supplied the key fields.
-    #   "low"   — only thin/absent sources were available (no brand/category extracted).
-    #   None    — enrichment not run (no LLM backend); structural fields only.
-    # The coverage report flags 'low' so a reviewer can see WHERE metadata is weak.
     metadata_confidence: str | None = None
+    # The schema-agnostic adapter-fact store (per-project). Values are already coerced to their
+    # declared facet type by the time they land here.
+    facts: dict = field(default_factory=dict)
+    facts_provenance: dict = field(default_factory=dict)
 
     @property
     def key(self) -> str:
         return f"{self.source_set}/{self.project_id}"
 
+    def fact(self, name: str, default=None):
+        """Convenience accessor for one adapter fact (e.g. rec.fact('app_name'))."""
+        return self.facts.get(name, default)
 
+
+# --- GENERIC schema: the engine-owned `projects` columns + the facet/EAV table -----------------
+# NO corpus-specific structured-fact column appears here. `projects` carries only generic
+# structural + enrichment + provenance columns; adapter facts live in `project_facts`.
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS projects (
     key              TEXT PRIMARY KEY,
     project_id       TEXT NOT NULL,
     source_set       TEXT NOT NULL,
-    app_category     TEXT,
-    theme_tags       TEXT,   -- JSON array
-    has_humor        INTEGER, -- 0/1/NULL
-    doc_types        TEXT,   -- JSON array
-    one_line_summary TEXT,
+    app_category     TEXT,     -- LLM enrichment: a short product category
+    theme_tags       TEXT,     -- JSON array (LLM enrichment: visual/narrative theme)
+    has_humor        INTEGER,  -- 0/1/NULL (LLM enrichment)
+    doc_types        TEXT,     -- JSON array (structural)
+    one_line_summary TEXT,     -- LLM enrichment
     chunk_count      INTEGER DEFAULT 0,
-    kotlin_source_id TEXT,    -- port/predecessor lineage link (provenance)
-    status           TEXT,    -- non-conforming status: released|unreleased|banned
-    non_conforming   INTEGER, -- 1 if project does not follow the standard structure
-    metadata_confidence TEXT, -- enrichment confidence: high|low|NULL(not run)
-    publisher        TEXT,    -- authoritative publisher from the roster TSV join
-    -- config.yaml harvest (deterministic, whitelist-only — NEVER secrets):
-    app_name         TEXT,    -- app.name (the app's product/display name)
-    domain           TEXT,    -- app.domain (homepage/website host)
-    landing_url      TEXT,    -- DERIVED: https://<domain>
-    app_number       TEXT,    -- app.number
-    bundle_id        TEXT,    -- app.bundle_id
-    localization     TEXT,    -- app.localization
-    contact_emails   TEXT,    -- JSON array, best-effort DERIVED from PHP templates
-    contact_emails_derived INTEGER  -- 1 if contact_emails was constructed (<local>@<domain>)
+    kotlin_source_id TEXT,     -- port/predecessor lineage link (provenance)
+    status           TEXT,     -- non-conforming status: released|unreleased|banned
+    non_conforming   INTEGER,  -- 1 if project does not follow the standard structure
+    metadata_confidence TEXT,  -- enrichment confidence: high|low|NULL(not run)
+    publisher        TEXT      -- authoritative publisher from the roster TSV join
+);
+CREATE TABLE IF NOT EXISTS project_facts (
+    key         TEXT NOT NULL,   -- project key (source_set/project_id)
+    project_id  TEXT NOT NULL,
+    source_set  TEXT NOT NULL,
+    field       TEXT NOT NULL,   -- the adapter-declared facet name
+    value       TEXT,            -- the value, stored as text/JSON (typed per value_type)
+    value_type  TEXT NOT NULL,   -- facet type: text|int|real|bool|text[]
+    provenance  TEXT,            -- descriptor|derived|...
+    PRIMARY KEY (key, field)
 );
 """
 
-
-# Columns added after the original schema shipped. `CREATE TABLE IF NOT EXISTS` won't add
-# these to an existing DB, so we ALTER-ADD any that are missing — a tiny, safe migration so a
-# schema bump never breaks an existing (gitignored) sidecar.
+# Migrations for a pre-existing DB. `CREATE TABLE IF NOT EXISTS` won't add missing columns; the
+# facet table is new so it's created above. (The old hardcoded app columns, if present on a legacy
+# DB, are simply ignored — the facet table + `facts` dict supersede them.)
 _MIGRATIONS = {
     "kotlin_source_id": "TEXT",
     "status": "TEXT",
     "non_conforming": "INTEGER",
     "metadata_confidence": "TEXT",
     "publisher": "TEXT",
-    "app_name": "TEXT",
-    "domain": "TEXT",
-    "landing_url": "TEXT",
-    "app_number": "TEXT",
-    "bundle_id": "TEXT",
-    "localization": "TEXT",
-    "contact_emails": "TEXT",
-    "contact_emails_derived": "INTEGER",
 }
+
+
+def _declared_facets() -> dict[str, str]:
+    """{facet_name: facet_type} across all registered adapters (the queryable/writable allowlist).
+    Local import so sidecar stays importable even if sources isn't fully wired."""
+    from .sources.registry import all_declared_facets
+
+    return all_declared_facets()
+
+
+def _facts_view_sql(facets: dict[str, str]) -> str:
+    """Build the pivoted VIEW that aggregate.py queries: `projects` LEFT-JOINed with one
+    MAX(CASE ...) column per DECLARED facet, so every facet is a queryable column. Facet names come
+    from adapter declarations (validated to a safe identifier) — never user/LLM input — so inlining
+    them as column names is safe. A DB with no declared facets yields a view == `projects`."""
+    cols = []
+    for name in sorted(facets):
+        if not name.replace("_", "").isalnum():  # defensive: declared names must be identifiers
+            continue
+        cols.append(
+            f"MAX(CASE WHEN pf.field = '{name}' THEN pf.value END) AS \"{name}\"")
+    facet_select = (",\n    " + ",\n    ".join(cols)) if cols else ""
+    return f"""
+CREATE TEMP VIEW projects_q AS
+SELECT p.*{facet_select}
+FROM projects p
+LEFT JOIN project_facts pf ON pf.key = p.key
+GROUP BY p.key;
+"""
 
 
 def connect(path: Path = SIDECAR_PATH) -> sqlite3.Connection:
     conn = sqlite3.connect(str(path))
     conn.row_factory = sqlite3.Row
-    conn.execute(_SCHEMA)
-    # Forward-migrate: add any columns missing from a pre-existing table.
+    conn.executescript(_SCHEMA)
+    # Forward-migrate the generic `projects` table.
     existing = {r["name"] for r in conn.execute("PRAGMA table_info(projects)")}
     for col, sql_type in _MIGRATIONS.items():
         if col not in existing:
@@ -158,21 +185,38 @@ def connect(path: Path = SIDECAR_PATH) -> sqlite3.Connection:
     return conn
 
 
+def facet_columns(facets: dict[str, str] | None = None) -> list[str]:
+    """The declared facet names (queryable field allowlist), sorted. Defaults to all registered
+    adapters' declared facets."""
+    facets = _declared_facets() if facets is None else facets
+    return sorted(n for n in facets if n.replace("_", "").isalnum())
+
+
+def create_query_view(conn: sqlite3.Connection, facets: dict[str, str] | None = None) -> None:
+    """(Re)create the TEMP pivoted view `projects_q` for THIS connection, one column per declared
+    facet. aggregate.py calls this on its read-only connection before running a templated query."""
+    facets = _declared_facets() if facets is None else facets
+    conn.execute("DROP VIEW IF EXISTS projects_q")
+    conn.executescript(_facts_view_sql(facets))
+
+
 def upsert_project(conn: sqlite3.Connection, rec: ProjectRecord) -> None:
+    """Write the generic `projects` row AND replace this project's `project_facts` rows.
+
+    Fail-closed + type-safe: only facts whose name is a DECLARED facet are written, and each value
+    is COERCED to its declared type. A mistyped value raises in coerce_facet_value — caught HERE so
+    that ONE facet is skipped (never aborting the whole ingest batch); the skip is recorded via the
+    returned/absent row (observable as a null facet)."""
     conn.execute(
         """
         INSERT INTO projects (key, project_id, source_set, app_category,
                               theme_tags, has_humor, doc_types, one_line_summary, chunk_count,
                               kotlin_source_id, status, non_conforming, metadata_confidence,
-                              publisher,
-                              app_name, domain, landing_url, app_number, bundle_id, localization,
-                              contact_emails, contact_emails_derived)
+                              publisher)
         VALUES (:key, :project_id, :source_set, :app_category,
                 :theme_tags, :has_humor, :doc_types, :one_line_summary, :chunk_count,
                 :kotlin_source_id, :status, :non_conforming, :metadata_confidence,
-                :publisher,
-                :app_name, :domain, :landing_url, :app_number, :bundle_id, :localization,
-                :contact_emails, :contact_emails_derived)
+                :publisher)
         ON CONFLICT(key) DO UPDATE SET
             app_category=excluded.app_category,
             theme_tags=excluded.theme_tags, has_humor=excluded.has_humor,
@@ -180,11 +224,7 @@ def upsert_project(conn: sqlite3.Connection, rec: ProjectRecord) -> None:
             chunk_count=excluded.chunk_count, kotlin_source_id=excluded.kotlin_source_id,
             status=excluded.status, non_conforming=excluded.non_conforming,
             metadata_confidence=excluded.metadata_confidence,
-            publisher=excluded.publisher,
-            app_name=excluded.app_name, domain=excluded.domain, landing_url=excluded.landing_url,
-            app_number=excluded.app_number, bundle_id=excluded.bundle_id,
-            localization=excluded.localization, contact_emails=excluded.contact_emails,
-            contact_emails_derived=excluded.contact_emails_derived
+            publisher=excluded.publisher
         """,
         {
             "key": rec.key,
@@ -201,19 +241,62 @@ def upsert_project(conn: sqlite3.Connection, rec: ProjectRecord) -> None:
             "non_conforming": None if rec.non_conforming is None else int(rec.non_conforming),
             "metadata_confidence": rec.metadata_confidence,
             "publisher": rec.publisher,
-            "app_name": rec.app_name,
-            "domain": rec.domain,
-            "landing_url": rec.landing_url,
-            "app_number": rec.app_number,
-            "bundle_id": rec.bundle_id,
-            "localization": rec.localization,
-            "contact_emails": json.dumps(rec.contact_emails),
-            "contact_emails_derived": (
-                None if rec.contact_emails_derived is None else int(rec.contact_emails_derived)
-            ),
         },
     )
+    # Replace the project's facet rows (idempotent re-ingest).
+    conn.execute("DELETE FROM project_facts WHERE key = ?", (rec.key,))
+    facets = _declared_facets()
+    for name, value in rec.facts.items():
+        ftype = facets.get(name)
+        if ftype is None:
+            continue  # fail-closed: an undeclared facet is never stored
+        try:
+            coerced = coerce_facet_value(value, ftype)
+        except (ValueError, TypeError):
+            continue  # a MISTYPED fact degrades this ONE facet; the batch continues
+        if coerced is None:
+            continue
+        stored = json.dumps(coerced) if ftype == "text[]" else str(coerced)
+        conn.execute(
+            "INSERT OR REPLACE INTO project_facts "
+            "(key, project_id, source_set, field, value, value_type, provenance) "
+            "VALUES (?,?,?,?,?,?,?)",
+            (rec.key, rec.project_id, rec.source_set, name, stored, ftype,
+             rec.facts_provenance.get(name)),
+        )
     conn.commit()
+
+
+def project_facts(conn: sqlite3.Connection, key: str) -> dict:
+    """Read one project's facts → {field: value} (values decoded per their stored type)."""
+    out: dict[str, object] = {}
+    for r in conn.execute(
+            "SELECT field, value, value_type FROM project_facts WHERE key = ?", (key,)):
+        out[r["field"]] = _decode_fact(r["value"], r["value_type"])
+    return out
+
+
+def _decode_fact(value: str | None, value_type: str) -> object:
+    if value is None:
+        return None
+    if value_type == "text[]":
+        try:
+            return json.loads(value)
+        except (json.JSONDecodeError, TypeError):
+            return []
+    if value_type == "int":
+        try:
+            return int(value)
+        except ValueError:
+            return None
+    if value_type == "real":
+        try:
+            return float(value)
+        except ValueError:
+            return None
+    if value_type == "bool":
+        return value in ("1", "True", "true")
+    return value
 
 
 def all_projects(conn: sqlite3.Connection) -> list[ProjectRecord]:
@@ -221,13 +304,14 @@ def all_projects(conn: sqlite3.Connection) -> list[ProjectRecord]:
     out = []
     for r in rows:
         cols = r.keys()
-        # GRACEFUL CONSOLIDATION: a pre-migration DB may still carry a legacy product-name column
-        # ("brand", whose semantics were the product name). Fold it into app_name when app_name is
-        # empty, so old sidecars keep their product-name signal under the new single field.
-        app_name = r["app_name"]
-        if not app_name and "brand" in cols:
-            app_name = r["brand"]
-        publisher = r["publisher"] if "publisher" in cols else None
+        key = r["key"]
+        facts = project_facts(conn, key)
+        # Provenance per fact (for observability / the derived flag).
+        prov = {
+            fr["field"]: fr["provenance"]
+            for fr in conn.execute(
+                "SELECT field, provenance FROM project_facts WHERE key = ?", (key,))
+        }
         out.append(
             ProjectRecord(
                 project_id=r["project_id"],
@@ -242,18 +326,9 @@ def all_projects(conn: sqlite3.Connection) -> list[ProjectRecord]:
                 status=r["status"],
                 non_conforming=None if r["non_conforming"] is None else bool(r["non_conforming"]),
                 metadata_confidence=r["metadata_confidence"],
-                publisher=publisher,
-                app_name=app_name,
-                domain=r["domain"],
-                landing_url=r["landing_url"],
-                app_number=r["app_number"],
-                bundle_id=r["bundle_id"],
-                localization=r["localization"],
-                contact_emails=json.loads(r["contact_emails"] or "[]"),
-                contact_emails_derived=(
-                    None if r["contact_emails_derived"] is None
-                    else bool(r["contact_emails_derived"])
-                ),
+                publisher=r["publisher"] if "publisher" in cols else None,
+                facts=facts,
+                facts_provenance=prov,
             )
         )
     return out

@@ -42,6 +42,14 @@ from .northwind import NorthwindAdapter
 # folder-name → adapter class. The folder under corpus_root selects the adapter. The CORE
 # registers the bundled synthetic SAMPLE adapters; custom adapters add themselves
 # via register_adapter() from the optional bootstrap (see _load_private_plugins).
+#
+# CONSTRAINT — process-global, ONE corpus per process. This dict (and the declared-facet union +
+# classification policies derived from it, plus query_classes._REGISTRY and
+# roster._FAMILY_TO_TSV_STEM) is module-level MUTABLE state shared across the interpreter. Two
+# corpora registering conflicting adapters/facets in the SAME process can cross-misroute. Today the
+# engine serves one corpus per process; the tests reset these globals between cases via an autouse
+# fixture (tests/conftest.py). Follow-up: per-corpus registry scoping (an owning Engine/Corpus
+# object) — tracked as "follow-up: per-corpus registry scoping".
 ADAPTER_BY_FOLDER: dict[str, type[SourceAdapter]] = {
     "northwind": NorthwindAdapter,
     "atlas": AtlasAdapter,
@@ -189,6 +197,57 @@ def get_adapters(corpus_root: Path) -> list[SourceAdapter]:
         if cls is not None:
             adapters.append(cls(child))
     return adapters
+
+
+def adapter_class_for_source_set(source_set: str) -> type[SourceAdapter] | None:
+    """Resolve the registered adapter CLASS that produces `source_set` (Phase-4 fact/policy hooks).
+
+    The registry keys adapters by their on-disk FOLDER, which usually equals `source_set`; but a
+    corpus may split one folder into several source-sets (e.g. a `foo` folder emitting `foo` and
+    `foo-variant`). So we match by the adapter's declared `source_set` first (exact), then fall
+    back to the base FAMILY (the part before the first '-', mirroring the roster join). Returns None
+    when no adapter is registered for it — the caller degrades gracefully (no structured facts).
+
+    This is what lets the corpus-agnostic pipeline (enrich.py) ask an adapter for its structured
+    facts WITHOUT the core knowing any adapter or field name."""
+    if not source_set:
+        return None
+    # Exact match on the adapter's declared source_set.
+    for cls in ADAPTER_BY_FOLDER.values():
+        if getattr(cls, "source_set", None) == source_set:
+            return cls
+    # Fall back to the base family (before the first '-'), matched against folder key or source_set.
+    family = source_set.split("-", 1)[0].lower()
+    for folder, cls in ADAPTER_BY_FOLDER.items():
+        if folder.lower() == family or str(getattr(cls, "source_set", "")).lower() == family:
+            return cls
+    return None
+
+
+def all_declared_facets() -> dict[str, str]:
+    """The UNION of every registered adapter's declared facets → {facet_name: facet_type} (#36).
+
+    This is the schema-agnostic source of truth for what the sidecar facet store will ACCEPT and
+    what `aggregate` will treat as a QUERYABLE field — derived from adapter DECLARATIONS, never a
+    core dataclass. On a facet-name/type collision across adapters, first-registered wins (a warning
+    is out of scope here; corpora are expected to namespace or agree). Includes any plugin-loaded
+    adapters (they've registered by the time this runs)."""
+    ensure_plugins_loaded()
+    out: dict[str, str] = {}
+    for cls in ADAPTER_BY_FOLDER.values():
+        try:
+            facets = cls(Path(".")).declared_facets()
+        except Exception:  # noqa: BLE001 — a broken adapter never breaks fact-schema resolution
+            continue
+        for spec in facets:
+            out.setdefault(spec.name, spec.type)
+    return out
+
+
+def ensure_plugins_loaded() -> None:
+    """Trigger the optional plugin load (idempotent) so out-of-tree adapters are registered before
+    we enumerate declared facets. Safe to call repeatedly (guarded to run once per process)."""
+    load_optional_plugins()
 
 
 def discover_all(corpus_root: Path) -> list[SourceDoc]:
