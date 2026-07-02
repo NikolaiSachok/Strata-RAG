@@ -74,6 +74,37 @@ class ClassificationPolicy:
 
 
 @dataclass(frozen=True)
+class HarvestedEntity:
+    """A STRUCTURED, facts-only entity harvested from a system-of-record file (#41): a spreadsheet
+    ROW, or any per-record descriptor whose value is its structured fields, NOT narrative prose.
+
+    WHY this is a SEPARATE thing from a SourceDoc (the load-bearing distinction):
+      A SourceDoc is NARRATIVE that gets chunked + embedded + retrieved. A HarvestedEntity is
+      STRUCTURED data that gets stored in the sidecar facet store and answered by `aggregate`
+      (count/group_by/sum) — it is NEVER embedded (embedding table rows dilutes top-k and can't be
+      counted anyway). So the ingest path treats it as its OWN entity: one sidecar record per row,
+      chunk_count 0, its columns mapped to DECLARED facets. This is what makes an aggregation
+      question over a spreadsheet answer deterministically from the sidecar.
+
+    Fields:
+      entity_id   — a stable, per-corpus-UNIQUE id for this row/record (e.g. a claim id, or
+                    "<file-stem>-r<row>"). Becomes the sidecar record's project_id, so it MUST be
+                    unique within the source_set or two rows collapse onto one key.
+      source_set  — which source-set/family this entity belongs to (the sidecar record's source_set).
+      facts       — the StructuredFacts for this entity (each names a DECLARED facet; stored
+                    fail-closed). The column→facet MAPPING is the adapter's business — the core
+                    carries no column names.
+      provenance  — where it came from, kept generic + human-readable (e.g. "loss-run.xlsx:Loss Run#3"
+                    — file/sheet/row), retained for auditability.
+    """
+
+    entity_id: str
+    source_set: str
+    facts: tuple = ()
+    provenance: str = ""
+
+
+@dataclass(frozen=True)
 class SourceDoc:
     """One document discovered in the corpus, normalised to a single shape.
 
@@ -166,6 +197,19 @@ class SourceAdapter(abc.ABC):
         corpus-rules.yaml alone)."""
         return ClassificationPolicy()
 
+    def harvest_entities(self) -> Iterable["HarvestedEntity"]:
+        """(#41) Yield STRUCTURED, facts-only entities — one per spreadsheet ROW (or any per-record
+        system-of-record) — that must become their OWN sidecar records, NOT embedded prose.
+
+        This is the spreadsheet-aggregation seam: the adapter uses the core `extract.read_tabular`
+        reader to parse rows, maps each row's COLUMNS to its DECLARED facets (the mapping is the
+        adapter's business — the core knows no column names), and yields one HarvestedEntity per
+        row. The ingest path turns each into a facts-only ProjectRecord so `aggregate`
+        (count/group_by/sum) answers over the rows from the sidecar. Corpus-wide (not per-project),
+        because a spreadsheet spans the whole corpus, not one project folder. Default: none — a
+        corpus with no tabular data overrides nothing and this path is a clean no-op."""
+        return ()
+
     # ---- small shared helpers concrete adapters can reuse ------------------
 
     @staticmethod
@@ -188,3 +232,18 @@ class SourceAdapter(abc.ABC):
         doc = Document(str(path))
         parts = [p.text for p in doc.paragraphs if p.text and p.text.strip()]
         return "\n".join(parts)
+
+    @staticmethod
+    def read_pdf(path: Path):
+        """Extract a born-digital PDF → a `PdfExtraction` (pages + text + a scanned/no-text-layer
+        flag), via the pluggable extractor (#39).
+
+        WHY here (next to read_docx): PDF is the dominant enterprise document format, so multi-format
+        corpora need first-class PDF text. An adapter calls this, then builds a SourceDoc from
+        `extraction.text()` (which carries `[page N]` provenance) — UNLESS `extraction.scanned` is
+        True (no text layer → a scanned image PDF), which the adapter surfaces as a coverage warning
+        rather than embedding empty chunks. Lazy import so a corpus that never sees a PDF pays
+        nothing, and the pypdf dependency stays optional to the text-only path."""
+        from ..extract.pdf import extract_pdf  # lazy: only paid when a PDF is actually read
+
+        return extract_pdf(path)

@@ -184,6 +184,11 @@ def ingest(settings: Settings = SETTINGS, *, use_enrich: bool = True,
     conn = connect()
     records = enrich_all(included, chunk_counts, settings, use_llm=use_enrich,
                          on_record=lambda rec: upsert_project(conn, rec))
+    # STRUCTURED, facts-only entities (#41 — spreadsheet rows etc.): a SEPARATE path from the
+    # document enrich loop. Each row becomes its own facts-only sidecar record (chunk_count 0, never
+    # embedded), so an aggregation question over the spreadsheet answers from the sidecar via the
+    # existing `aggregate` path — with NO raw-table dilution of the vector index.
+    n_entities = _ingest_structured_entities(conn, settings)
     conn.close()
 
     return {
@@ -193,9 +198,32 @@ def ingest(settings: Settings = SETTINGS, *, use_enrich: bool = True,
         "secrets_redacted": n_redactions,
         "pii_redacted": n_pii,
         "projects_enriched": len(records),
+        "structured_entities": n_entities,
         "total_in_collection": count(client, settings),
         "collection": settings.collection_name,
     }
+
+
+def _ingest_structured_entities(conn, settings: Settings = SETTINGS) -> int:
+    """Harvest STRUCTURED, facts-only entities (#41) from every adapter's `harvest_entities` hook
+    and write one facts-only sidecar record per entity. Returns the number written.
+
+    Corpus-agnostic: the adapters own the column→facet mapping (the core knows no column names);
+    here we just fold the yielded facts into records (fail-closed against declared facets) and
+    upsert. A corpus with no tabular data yields nothing → a clean no-op. Runs on the MAIN thread
+    (same single SQLite connection as the document enrich writes)."""
+    from .enrich import _log, entities_to_records
+    from .sources import harvest_all_entities
+
+    entities = harvest_all_entities(settings.corpus_root)
+    if not entities:
+        return 0
+    records = entities_to_records(entities)
+    for rec in records:
+        upsert_project(conn, rec)
+    _log(f"[structured] {len(records)} facts-only entities (rows) written to the sidecar "
+         f"(NOT embedded — queryable via aggregate)")
+    return len(records)
 
 
 def enrich_only(settings: Settings = SETTINGS, *, use_enrich: bool = True) -> dict:
@@ -231,11 +259,15 @@ def enrich_only(settings: Settings = SETTINGS, *, use_enrich: bool = True) -> di
     conn = connect()
     records = enrich_all(included, chunk_counts, settings, use_llm=use_enrich,
                          on_record=lambda rec: upsert_project(conn, rec))
+    # Refresh the structured facts-only entities too (spreadsheet rows), so a sidecar refresh is
+    # complete without re-embedding.
+    n_entities = _ingest_structured_entities(conn, settings)
     conn.close()
     return {
         "included_docs": len(included),
         "projects_enriched": len(records),
         "chunks_counted": len(chunks),
+        "structured_entities": n_entities,
     }
 
 
@@ -290,6 +322,7 @@ def main() -> None:
         f"  secrets redacted  : {summary['secrets_redacted']}\n"
         f"  PII redacted      : {summary['pii_redacted']}\n"
         f"  projects enriched : {summary['projects_enriched']}\n"
+        f"  structured rows   : {summary['structured_entities']}\n"
         f"  total in Qdrant   : {summary['total_in_collection']}\n"
         f"  embeddings        : {settings.embeddings} ({settings.embed_model})\n"
         f"  collection        : {summary['collection']}\n"

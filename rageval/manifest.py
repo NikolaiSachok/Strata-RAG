@@ -48,6 +48,9 @@ class Coverage:
     projects_with_content: list[str] = field(default_factory=list)   # "source_set/project_id"
     blind_spots: list[str] = field(default_factory=list)             # zero included docs
     outliers: list[tuple[str, int]] = field(default_factory=list)    # (project, doc_count)
+    # (#39) PDFs discovered with NO text layer (scanned/image) → need OCR, not this text path.
+    # Surfaced so a scanned PDF is a VISIBLE coverage gap, never a silently-empty ingest.
+    scanned_pdfs: list[str] = field(default_factory=list)            # doc_ids of no-text-layer PDFs
 
 
 @dataclass
@@ -87,11 +90,17 @@ def build_manifest(all_docs: list[SourceDoc], rules: CorpusRules,
 
     # project -> number of INCLUDED docs (for coverage + outlier detection)
     included_per_project: dict[str, int] = {}
+    scanned_pdfs: list[str] = []
 
     # Resolve each doc's adapter ClassificationPolicy (#37), cached by source_set.
     resolver = PolicyResolver()
 
     for doc in all_docs:
+        # (#39) A discovered PDF the extractor flagged as scanned/no-text-layer: record it as a
+        # coverage warning REGARDLESS of its classify verdict (it'll fall out as near-empty), so a
+        # scanned PDF is a visible gap that routes to OCR, never a silent blind spot.
+        if doc.folder_meta.get("pdf_scanned"):
+            scanned_pdfs.append(doc.doc_id)
         dec = classify(doc, rules, resolver.policy_for(doc.source_set))
         if dec.include:
             # Plan the SAME redaction the ingest will do (secrets AND PII), so the manifest's
@@ -141,7 +150,7 @@ def build_manifest(all_docs: list[SourceDoc], rules: CorpusRules,
         included=included,
         excluded=excluded,
         coverage=Coverage(projects_with_content=with_content, blind_spots=blind,
-                          outliers=outliers),
+                          outliers=outliers, scanned_pdfs=sorted(scanned_pdfs)),
         total_chunks=total_chunks,
         total_chars=total_chars,
         total_redactions=total_redactions,
@@ -201,5 +210,10 @@ def render_manifest(m: Manifest, settings: Settings = SETTINGS) -> str:
     lines.append(f"  doc-count outliers : {len(cov.outliers)}")
     for p, n in cov.outliers:
         lines.append(f"      ??  {p}  ({n} docs)")
+    # (#39) Scanned / no-text-layer PDFs — a coverage gap that needs OCR (a separate provider seam),
+    # surfaced so it's never mistaken for a clean ingest.
+    lines.append(f"  SCANNED PDFs (no text layer → need OCR) : {len(cov.scanned_pdfs)}")
+    for p in cov.scanned_pdfs:
+        lines.append(f"      ocr {p}")
     lines.append("=" * 72)
     return "\n".join(lines)

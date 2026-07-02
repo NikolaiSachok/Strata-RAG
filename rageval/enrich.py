@@ -247,6 +247,32 @@ def _apply_facts(rec: ProjectRecord, facts: list[StructuredFact]) -> None:
         _set_fact(rec, fact.field, fact.value, fact.provenance)
 
 
+def entities_to_records(entities: list, chunk_count: int = 0) -> list[ProjectRecord]:
+    """Turn adapter-harvested STRUCTURED entities (#41 — spreadsheet rows etc.) into facts-only
+    ProjectRecords the sidecar can store + `aggregate` can query.
+
+    Each HarvestedEntity becomes ONE record whose project_id IS its entity_id, source_set its
+    source_set, chunk_count 0 (never embedded — this is structured data, not narrative), and whose
+    facts are folded in fail-closed against the DECLARED-facet allowlist (an undeclared column is
+    silently dropped — the core knows no column names; the adapter declared which columns are
+    facets). Type coercion happens again at sidecar write, so a mistyped cell degrades that ONE
+    facet, never the batch.
+
+    This path is DELIBERATELY SEPARATE from the document enrich loop (enrich_all): documents are
+    narrative→embedded; these are structured→aggregated. Keeping them apart means the row-entities
+    never touch the vector index and the document path's behaviour is unchanged."""
+    records: list[ProjectRecord] = []
+    for ent in entities:
+        rec = ProjectRecord(project_id=ent.entity_id, source_set=ent.source_set,
+                            chunk_count=chunk_count)
+        # Each fact carries its OWN provenance (descriptor/derived); the entity-level provenance
+        # (file:sheet#row) stays on the HarvestedEntity for logging/audit, not a sidecar column.
+        for fact in ent.facts:
+            _set_fact(rec, fact.field, fact.value, fact.provenance)
+        records.append(rec)
+    return records
+
+
 def _parse_json(raw: str) -> dict:
     raw = raw.strip()
     fence = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", raw, re.DOTALL)
