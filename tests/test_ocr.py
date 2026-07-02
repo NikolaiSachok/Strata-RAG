@@ -12,6 +12,7 @@ self-contained, nothing binary is committed.
 
 from __future__ import annotations
 
+import builtins
 import dataclasses
 import importlib.util
 import shutil
@@ -82,6 +83,54 @@ def test_tesseract_degrades_when_stack_absent(monkeypatch):
     provider, reason = get_ocr_provider(_settings(ocr_provider="tesseract"))
     assert provider is None
     assert reason and "tesseract" in reason.lower()
+
+
+def _block_imports(monkeypatch, *blocked: str) -> None:
+    """Make an import raise ImportError when its module name (or a parent of it) is in `blocked`,
+    deterministically, no matter what's installed. We wrap builtins.__import__ so the provider's
+    LAZY imports fail as if the package were absent — this lets us test the degrade paths on ANY
+    machine (a box WITH the full OCR stack still exercises the missing-package branches).
+
+    Matching is on the DOTTED PREFIX: blocking "PIL" also blocks "PIL.Image"; blocking exactly
+    "PIL.Image" leaves a bare "import PIL" alone. That distinction matters here — `import
+    pytesseract` pulls in PIL internally, so to isolate the provider's OWN `import PIL.Image`
+    (line 121) we block just that submodule and leave pytesseract's own import working."""
+    real_import = builtins.__import__
+
+    def fake_import(name, *args, **kwargs):
+        parts = name.split(".")
+        for i in range(len(parts)):
+            if ".".join(parts[: i + 1]) in blocked:
+                raise ImportError(f"blocked import of {name!r} for the test")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+
+
+def test_tesseract_degrades_when_pytesseract_missing(monkeypatch):
+    """The pytesseract-missing degrade path — forced via a blocked import so it runs on any
+    machine, not only where pytesseract is absent."""
+    _block_imports(monkeypatch, "pytesseract")
+    provider, reason = get_ocr_provider(_settings(ocr_provider="tesseract"))
+    assert provider is None
+    assert reason and "pytesseract" in reason.lower()
+
+
+@pytest.mark.skipif(
+    importlib.util.find_spec("pytesseract") is None,
+    reason="reaching the PIL check requires pytesseract to import first",
+)
+def test_tesseract_degrades_when_pillow_missing(monkeypatch):
+    """The Pillow-missing degrade path — forced by blocking ONLY the `PIL.Image` submodule the
+    provider imports at line 121, so `import pytesseract` (which pulls PIL in internally, already
+    cached) still succeeds and we reach the PIL branch specifically. Skipped where pytesseract is
+    absent (you can't reach the PIL check without it)."""
+    import pytesseract  # noqa: F401 - ensure it's cached so its own import doesn't re-run PIL
+
+    _block_imports(monkeypatch, "PIL.Image")
+    provider, reason = get_ocr_provider(_settings(ocr_provider="tesseract"))
+    assert provider is None
+    assert reason and ("pillow" in reason.lower() or "pil" in reason.lower())
 
 
 def test_llm_ocr_degrades_when_vision_unconfigured(monkeypatch):

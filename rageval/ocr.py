@@ -2,11 +2,19 @@
 
 WHY this matters for RAG: a SCANNED document is an image of text. A born-digital extractor
 (python-docx, a PDF text layer) sees nothing there — the words only exist as pixels, so they must
-be OCR'd before they can be chunked, embedded, and retrieved. The public strata-insurance-corpus
-has a whole `ocr` golden class: scan-only documents whose facts live on no born-digital page.
+be OCR'd before they can be chunked, embedded, and retrieved. Any corpus that mixes scans with
+born-digital files has facts that live on no extractable page; without OCR they are simply
+invisible to retrieval.
 
 Like the vision seam (vision.py) and the text LLM (llm.py), we factor the OCR engine behind a
 small BACKEND seam so the backend is CONFIGURABLE and carries NO hard import dependency.
+
+VALIDATION SCOPE (be precise about what's proven here vs. later): THIS module is validated in the
+test suite by a deterministic mock backend + a real-Tesseract round-trip (render text to a PNG,
+OCR it back). It is NOT yet exercised end-to-end over a real scanned corpus. The OCR modality will
+be run end-to-end against the public strata-insurance-corpus
+(https://huggingface.co/datasets/NikolaiSachok/strata-insurance-corpus), whose eval set includes a
+scan-only class, once that corpus's adapter + external eval harness land (#40 / #42).
 
 THE CONTRACT every backend satisfies (OcrProvider):
 
